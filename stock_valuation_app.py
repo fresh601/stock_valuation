@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 네이버(와이즈리포트) 자동 수집 + 적정주가 계산 최종본 (현재가는 수동 입력)
-- 티커 6자리만 입력하면 Selenium으로 encparam/id 획득 → main/fs/profit/value 자동 수집
+- encparam/id 자동 획득(Selenium) → main/fs/profit/value 자동 수집
 - EPS/BPS/EBITDA/FCF₀/순부채/발행주식수 추출
   · (E)/Estimate/예상/FWD 표기가 있는 열을 최우선으로 선택, 없으면 가장 오른쪽 실적 열 사용
   · 모든 표 단위(UNIT)를 '원' 기준으로 환산
 - DCF(3구간 성장 + 터미널) + 상대가치(PER/PBR/EV/EBITDA) + MIX(가중치)
 - 시나리오 버튼(보수/기준/낙관)으로 성장률·할인율·안전마진 자동 세팅
 - 현재가는 사용자가 직접 입력 → 현재가/적정가/상승여력 카드 표시
+- Plotly 4.x/5.x 호환( text_auto 미사용, 안전 헬퍼 사용 )
 - 결과 엑셀에 META(선택된 열, 단위, 시나리오, 가중치, 기준시점 라벨) 기록
 
 필수 설치:
@@ -41,9 +42,16 @@ st.set_page_config(page_title="적정주가 계산기 · 최종본", layout="wid
 # ──────────────────────────────────────────────────────────────
 UNIT_MAP = {
     '원': 1.0,
-    '천원': 1e3, '만원': 1e4, '백만원': 1e8, '억원': 1e8, '조원': 1e12,
-    '십억원': 1e9, '백억원': 1e10, '천억원': 1e11,
+    '천원': 1e3,
+    '만원': 1e4,
+    '백만원': 1e8,  # 일부 표는 '백만원'이 실제로 1e6로 표기되나, 와이즈리포트 JSON은 보통 원 단위 문자열을 반환 → 아래에서 숫자화하며 재확인 필요
+    '억원': 1e8,
+    '십억원': 1e9,
+    '백억원': 1e10,
+    '천억원': 1e11,
+    '조원': 1e12,
 }
+
 
 def nvl(x, default=None):
     try:
@@ -100,7 +108,7 @@ def scale_by_unit(df: pd.DataFrame, unit_col: str = '단위') -> pd.DataFrame:
     if df is None or df.empty:
         return df
     if unit_col not in df.columns:
-        # 그래도 숫자형으로 통일
+        # 숫자형으로 통일
         num_cols = [c for c in df.columns if c not in ("항목", "단위", "전년대비 (YoY, %)")]
         df[num_cols] = df[num_cols].replace(",", "", regex=True).apply(pd.to_numeric, errors='coerce')
         return df
@@ -116,7 +124,7 @@ def scale_by_unit(df: pd.DataFrame, unit_col: str = '단위') -> pd.DataFrame:
 
 
 def pick_latest_estimate(row: pd.Series):
-    """(E)/Estimate/예상/FWD 라벨이 붙은 열을 뒤에서 앞으로 우선 탐색 → 없으면 일반 열을 뒤에서 앞으로.
+    """(E)/Estimate/예상/FWD 라벨이 있는 열을 뒤에서 앞으로 우선 탐색 → 없으면 일반 열을 뒤에서 앞으로.
     Returns: (value: float|None, used_col_name: str|None, used_type: 'estimate'|'actual'|None)
     """
     cols = list(row.index)
@@ -132,6 +140,33 @@ def pick_latest_estimate(row: pd.Series):
         if pd.notna(v):
             return float(v), cols[i], 'actual'
     return None, None, None
+
+# ──────────────────────────────────────────────────────────────
+# 안전한 차트 헬퍼 (Plotly 4.x/5.x 공용)
+# ──────────────────────────────────────────────────────────────
+
+def safe_bar(df: pd.DataFrame, x: str, y: str, color: str = None, textfmt: str = '.2f', title: str = None):
+    df2 = df.dropna(subset=[y]).copy()
+    if df2.empty:
+        return None
+    df2[y] = pd.to_numeric(df2[y], errors='coerce')
+    fig = px.bar(df2, x=x, y=y, color=color)
+    fig.update_traces(texttemplate=f"%{{y:{textfmt}}}", textposition="outside")
+    fig.update_layout(
+        uniformtext_minsize=8, uniformtext_mode="show",
+        margin=dict(t=40, r=20, l=20, b=50), title=title or ""
+    )
+    return fig
+
+
+def safe_line(df: pd.DataFrame, x: str, y: str, color: str = None, title: str = None):
+    df2 = df.dropna(subset=[y]).copy()
+    if df2.empty:
+        return None
+    df2[y] = pd.to_numeric(df2[y], errors='coerce')
+    fig = px.line(df2, x=x, y=y, color=color, markers=True)
+    fig.update_layout(margin=dict(t=40, r=20, l=20, b=50), title=title or "")
+    return fig
 
 # ──────────────────────────────────────────────────────────────
 # Selenium: encparam / id
@@ -292,7 +327,7 @@ def extract_core_numbers(df_main, df_fs, df_profit, df_value):
     if bps is None:
         bps, bps_col, bps_type = infer_from_main(df_main, [r"BPS"])  # 주당 값
 
-    ebitda, e_col, e_type = pick_latest_from_table(df_profit, [r"EBITDA"])  # 원 단위 값
+    ebitda, e_col, e_type = pick_latest_from_table(df_profit, [r"EBITDA"])
     if ebitda is None:
         ebitda, e_col, e_type = infer_from_main(df_main, [r"EBITDA"])
 
@@ -302,7 +337,7 @@ def extract_core_numbers(df_main, df_fs, df_profit, df_value):
         cfo, cfo_col, _ = pick_latest_from_table(df_fs, [r"영업활동.*현금흐름|영업활동으로인한현금흐름|CFO"])
         capex, capex_col, _ = pick_latest_from_table(df_fs, [r"유형자산의\s*취득|CAPEX|설비투자|유형자산.*취득"])
         if cfo is not None and capex is not None:
-            # CAPEX가 음수(유출)면 그대로 더해도 됨
+            # CAPEX가 음수(유출)면 그대로 더하는 형태가 자연스러움
             fcf0 = float(cfo) + float(capex)
             fcf_col = f"CFO[{cfo_col}] + CAPEX[{capex_col}]"
             fcf_type = 'derived'
@@ -485,7 +520,6 @@ if run:
     px_ev  = evebitda_price(core["ebitda"], ev_mult, core["shares"], core["net_debt"], safety=safety)
 
     wsum = (w_dcf + w_per + w_pbr + w_ev) or 1.0
-    mix_price = None
     parts = []
     for px, w in [(px_dcf,w_dcf),(px_per,w_per),(px_pbr,w_pbr),(px_ev,w_ev)]:
         if px is not None:
@@ -494,12 +528,14 @@ if run:
 
     st.subheader("📌 적정주가 요약")
     summary = pd.DataFrame({
-        "방법": ["DCF", "PER", "PBR", "EV/EBITDA", "MIX(가중)"] ,
+        "방법": ["DCF", "PER", "PBR", "EV/EBITDA", "MIX(가중)"],
         "적정주가": [px_dcf, px_per, px_pbr, px_ev, mix_price],
     })
-    st.dataframe(summary, use_container_width=True)
-    fig = px.bar(summary.dropna(), x="방법", y="적정주가", text_auto='.2f')
-    st.plotly_chart(fig, use_container_width=True)
+    fig = safe_bar(summary, "방법", "적정주가", title="방법별 적정주가")
+    if fig is None:
+        st.info("표시할 적정주가 값이 없습니다.")
+    else:
+        st.plotly_chart(fig, use_container_width=True)
 
     # 6) 현재가 카드 및 상승여력
     colK1, colK2, colK3 = st.columns(3)
