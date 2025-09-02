@@ -1,0 +1,6 @@
+default-jre
+korean*
+fonts-unfonts-core
+chromium
+chromium-driver
+
