@@ -420,10 +420,10 @@ if run:
         st.stop()
 
     with st.spinner("데이터 수집(main/fs/profit/value)..."):
-    main, main_mul = fetch_main(cmp, enc, cid)
-    fs    = fetch_json(cmp, "fs", enc)
-    prof  = fetch_json(cmp, "profit", enc)
-    value = fetch_json(cmp, "value", enc)
+        main, main_mul = fetch_main(cmp, enc, cid)
+        fs    = fetch_json(cmp, "fs", enc)
+        prof  = fetch_json(cmp, "profit", enc)
+        value = fetch_json(cmp, "value", enc)
 
     if main is None or main.empty:
         st.warning("main_wide(연간 주요재무정보) 표를 찾지 못했습니다. FCF₀ 1차 소스(main)는 생략하고 value/파생으로 시도합니다.")
