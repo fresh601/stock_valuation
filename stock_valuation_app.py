@@ -3,13 +3,13 @@
 네이버(와이즈리포트) 자동 수집 + 적정주가 계산 최종본 (현재가는 수동 입력)
 - encparam/id 자동 획득(Selenium) → main/fs/profit/value 자동 수집
 - EPS/BPS/EBITDA/FCF₀/순부채/발행주식수 추출
-  · (E)/Estimate/예상/FWD 표기가 있는 열을 최우선으로 선택, 없으면 가장 오른쪽 실적 열 사용
+  · (E)/Estimate/예상/FWD 표기가 있는 열을 최우선, 없으면 가장 오른쪽 실적 열
   · 모든 표 단위(UNIT)를 '원' 기준으로 환산
-- DCF(3구간 성장 + 터미널) + 상대가치(PER/PBR/EV/EBITDA) + MIX(가중치)
+- DCF(3구간 성장 + TV) + 상대가치(PER/PBR/EV/EBITDA) + MIX(가중치)
 - 시나리오 버튼(보수/기준/낙관)으로 성장률·할인율·안전마진 자동 세팅
-- 현재가는 사용자가 직접 입력 → 현재가/적정가/상승여력 카드 표시
-- Plotly 4.x/5.x 호환( text_auto 미사용, 안전 헬퍼 사용 )
-- 결과 엑셀에 META(선택된 열, 단위, 시나리오, 가중치, 기준시점 라벨) 기록
+- 현재가 수동 입력 → 현재가/적정가/상승여력 카드 표시
+- Plotly **graph_objects** 기반 안전 차트(safe_bar_go, safe_line_go)
+- 결과 엑셀에 META(선택열, 단위, 시나리오, 가중치, 기준시점) 기록
 
 필수 설치:
   pip install streamlit selenium beautifulsoup4 lxml html5lib pandas requests openpyxl plotly numpy
@@ -27,9 +27,11 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import plotly.express as px
 from bs4 import BeautifulSoup
 from collections import defaultdict
+
+# Plotly (저수준 GO 사용)
+import plotly.graph_objects as go
 
 # Selenium (encparam/id 추출)
 from selenium import webdriver
@@ -44,14 +46,13 @@ UNIT_MAP = {
     '원': 1.0,
     '천원': 1e3,
     '만원': 1e4,
-    '백만원': 1e8,  # 일부 표는 '백만원'이 실제로 1e6로 표기되나, 와이즈리포트 JSON은 보통 원 단위 문자열을 반환 → 아래에서 숫자화하며 재확인 필요
+    '백만원': 1e8,   # 일부 제공 포맷 혼재 대비: 아래 숫자화와 함께 사용
     '억원': 1e8,
     '십억원': 1e9,
     '백억원': 1e10,
     '천억원': 1e11,
     '조원': 1e12,
 }
-
 
 def nvl(x, default=None):
     try:
@@ -62,7 +63,6 @@ def nvl(x, default=None):
         return x
     except Exception:
         return default
-
 
 def to_number(s):
     if s is None:
@@ -79,17 +79,14 @@ def to_number(s):
     except Exception:
         return None
 
-
 def clean_text(x: str) -> str:
     return re.sub(r"\s+", " ", (x or "").replace("\xa0", " ").strip())
-
 
 def extract_year_label(x: str) -> str:
     if not isinstance(x, str):
         x = str(x)
     m = re.search(r"(20\d{2})(?:[./-]?(?:0?[1-9]|1[0-2]))?", x)
     return m.group(1) if m else x
-
 
 def rightmost_value(row: pd.Series):
     for v in row[::-1]:
@@ -102,7 +99,6 @@ def rightmost_value(row: pd.Series):
                 except Exception:
                     pass
     return np.nan
-
 
 def scale_by_unit(df: pd.DataFrame, unit_col: str = '단위') -> pd.DataFrame:
     if df is None or df.empty:
@@ -122,19 +118,18 @@ def scale_by_unit(df: pd.DataFrame, unit_col: str = '단위') -> pd.DataFrame:
     df[num_cols] = df[num_cols].replace(",", "", regex=True).apply(pd.to_numeric, errors='coerce') * mul
     return df
 
-
 def pick_latest_estimate(row: pd.Series):
-    """(E)/Estimate/예상/FWD 라벨이 있는 열을 뒤에서 앞으로 우선 탐색 → 없으면 일반 열을 뒤에서 앞으로.
+    """(E)/Estimate/예상/FWD 라벨 열을 뒤에서 앞으로 우선 탐색 → 없으면 일반 열을 뒤에서 앞으로.
     Returns: (value: float|None, used_col_name: str|None, used_type: 'estimate'|'actual'|None)
     """
     cols = list(row.index)
-    # 1) 예상 라벨이 있는 열을 뒤에서 앞으로 탐색
+    # 1) 예상 라벨 있는 열 → 뒤에서 앞으로
     prefer_idx = [i for i, c in enumerate(cols) if re.search(r"\(E\)|Estimate|예상|FWD|Forward", str(c), re.I)]
     for i in reversed(prefer_idx):
         v = pd.to_numeric(str(row.iloc[i]).replace(',', ''), errors='coerce')
         if pd.notna(v):
             return float(v), cols[i], 'estimate'
-    # 2) 일반 열: 가장 오른쪽 비결측
+    # 2) 일반 열: 오른쪽 비결측
     for i in range(len(cols) - 1, -1, -1):
         v = pd.to_numeric(str(row.iloc[i]).replace(',', ''), errors='coerce')
         if pd.notna(v):
@@ -142,30 +137,46 @@ def pick_latest_estimate(row: pd.Series):
     return None, None, None
 
 # ──────────────────────────────────────────────────────────────
-# 안전한 차트 헬퍼 (Plotly 4.x/5.x 공용)
+# 안전 차트(Plotly graph_objects)
 # ──────────────────────────────────────────────────────────────
 
-def safe_bar(df: pd.DataFrame, x: str, y: str, color: str = None, textfmt: str = '.2f', title: str = None):
+def safe_bar_go(df: pd.DataFrame, x: str, y: str, title: str = None):
     df2 = df.dropna(subset=[y]).copy()
     if df2.empty:
         return None
     df2[y] = pd.to_numeric(df2[y], errors='coerce')
-    fig = px.bar(df2, x=x, y=y, color=color)
-    fig.update_traces(texttemplate=f"%{{y:{textfmt}}}", textposition="outside")
+    df2 = df2.dropna(subset=[y])
+    if df2.empty:
+        return None
+    x_vals = df2[x].astype(str).tolist()
+    y_vals = df2[y].astype(float).tolist()
+    text_vals = [f"{v:.2f}" if v is not None and not np.isnan(v) else "" for v in y_vals]
+    fig = go.Figure(data=[go.Bar(x=x_vals, y=y_vals, text=text_vals, textposition="outside")])
     fig.update_layout(
-        uniformtext_minsize=8, uniformtext_mode="show",
-        margin=dict(t=40, r=20, l=20, b=50), title=title or ""
+        title=title or "",
+        uniformtext_minsize=8,
+        uniformtext_mode="show",
+        margin=dict(t=40, r=20, l=20, b=50),
+        xaxis_title=x,
+        yaxis_title=y,
     )
     return fig
 
-
-def safe_line(df: pd.DataFrame, x: str, y: str, color: str = None, title: str = None):
+def safe_line_go(df: pd.DataFrame, x: str, y: str, color_name: str = None, title: str = None):
     df2 = df.dropna(subset=[y]).copy()
     if df2.empty:
         return None
     df2[y] = pd.to_numeric(df2[y], errors='coerce')
-    fig = px.line(df2, x=x, y=y, color=color, markers=True)
-    fig.update_layout(margin=dict(t=40, r=20, l=20, b=50), title=title or "")
+    df2 = df2.dropna(subset=[y])
+    if df2.empty:
+        return None
+    fig = go.Figure()
+    if color_name and color_name in df2.columns:
+        for key, g in df2.groupby(color_name):
+            fig.add_trace(go.Scatter(x=g[x].astype(str), y=g[y].astype(float), mode='lines+markers', name=str(key)))
+    else:
+        fig.add_trace(go.Scatter(x=df2[x].astype(str), y=df2[y].astype(float), mode='lines+markers', name=y))
+    fig.update_layout(title=title or "", margin=dict(t=40, r=20, l=20, b=50), xaxis_title=x, yaxis_title=y)
     return fig
 
 # ──────────────────────────────────────────────────────────────
@@ -187,11 +198,7 @@ def get_encparam_and_id(cmp_cd: str, page_key: str) -> dict:
         html = driver.page_source
         enc_match = re.search(r"encparam\s*:\s*['\"]?([a-zA-Z0-9+/=]+)['\"]?", html)
         id_match = re.search(r"cmp_cd\s*=\s*['\"]?([0-9]+)['\"]?", html)
-        return {
-            "cmp_cd": cmp_cd,
-            "encparam": enc_match.group(1) if enc_match else None,
-            "id": id_match.group(1) if id_match else None,
-        }
+        return {"cmp_cd": cmp_cd, "encparam": enc_match.group(1) if enc_match else None, "id": id_match.group(1) if id_match else None}
     finally:
         driver.quit()
 
@@ -200,14 +207,10 @@ def get_encparam_and_id(cmp_cd: str, page_key: str) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def fetch_main_table(cmp_cd: str, encparam: str, cmp_id: str):
+    import requests
     url = "https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx"
     cookies = {'setC1010001': '%5B%7B...%7D%5D'}
-    headers = {
-        'Accept': 'application/json, text/html, */*; q=0.01',
-        'User-Agent': 'Mozilla/5.0',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={cmp_cd}',
-    }
+    headers = {'Accept': 'application/json, text/html, */*; q=0.01', 'User-Agent': 'Mozilla/5.0', 'X-Requested-With': 'XMLHttpRequest', 'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={cmp_cd}'}
     params = {'cmp_cd': cmp_cd, 'fin_typ': '0', 'freq_typ': 'Y', 'encparam': encparam, 'id': cmp_id}
     res = requests.get(url, headers=headers, cookies=cookies, params=params, timeout=20)
     res.raise_for_status()
@@ -258,20 +261,13 @@ def parse_json_table(js: dict) -> pd.DataFrame:
     rows = [[r.get("ACC_NM", "")] + [r.get(k, "") for k in year_keys] for r in data]
     df = pd.DataFrame(rows, columns=["항목"] + labels[:len(year_keys)])
     df.insert(1, "단위", unit)
-    # 숫자화는 scale_by_unit에서 일괄 처리
     return df
 
 
 def fetch_json_mode(cmp_cd: str, mode: str, encparam: str) -> pd.DataFrame:
-    url = "https://navercomp.wisereport.co.kr/v2/company/cF3002.aspx" if mode == "fs" else \
-          "https://navercomp.wisereport.co.kr/v2/company/cF4002.aspx"
+    url = "https://navercomp.wisereport.co.kr/v2/company/cF3002.aspx" if mode == "fs" else "https://navercomp.wisereport.co.kr/v2/company/cF4002.aspx"
     rpt_map = {"fs": "1", "profit": "1", "value": "5"}
-    headers = {
-        'Accept': 'application/json, text/html, */*; q=0.01',
-        'User-Agent': 'Mozilla/5.0',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1040001.aspx?cmp_cd={cmp_cd}',
-    }
+    headers = {'Accept': 'application/json, text/html, */*; q=0.01', 'User-Agent': 'Mozilla/5.0', 'X-Requested-With': 'XMLHttpRequest', 'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1040001.aspx?cmp_cd={cmp_cd}'}
     cookies = {'setC1040001': '%5B%7B...%7D%5D'}
     params = {'cmp_cd': cmp_cd, 'frq': '0', 'rpt': rpt_map[mode], 'finGubun': 'MAIN', 'frqTyp': '0', 'cn': '', 'encparam': encparam}
     res = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=20)
@@ -298,7 +294,6 @@ def infer_from_main(df_main_wide: pd.DataFrame, patterns: list[str]):
             return val, col, used
     return None, None, None
 
-
 def pick_latest_from_table(df: pd.DataFrame, patterns: list[str]):
     if df is None or df.empty:
         return None, None, None
@@ -310,38 +305,30 @@ def pick_latest_from_table(df: pd.DataFrame, patterns: list[str]):
             return pick_latest_estimate(row)
     return None, None, None
 
-
 def extract_core_numbers(df_main, df_fs, df_profit, df_value):
     # 발행주식수 (가능하면 main에서)
-    shares, shares_col, shares_used = infer_from_main(df_main, [r"발행주식수|주식수|보통주수|총발행주식"])  # 단위가 '주'인지 확인 필요(보통 '주')
-
+    shares, shares_col, shares_used = infer_from_main(df_main, [r"발행주식수|주식수|보통주수|총발행주식"])  # 보통 '주'
     # 순부채 (*순부채 최우선)
-    net_debt, nd_col, nd_used = pick_latest_from_table(df_fs, [r"^\*?순부채", r"Net\s*Debt"])  # '원' 기준 환산됨
-
-    # EPS/BPS/EBITDA (value/profit/main 순)
+    net_debt, nd_col, nd_used = pick_latest_from_table(df_fs, [r"^\*?순부채", r"Net\s*Debt"])
+    # EPS/BPS/EBITDA
     eps, eps_col, eps_type = pick_latest_from_table(df_value,  [r"EPS"])
     if eps is None:
-        eps, eps_col, eps_type = infer_from_main(df_main, [r"EPS"])  # 주당 값
-
+        eps, eps_col, eps_type = infer_from_main(df_main, [r"EPS"])  # 주당
     bps, bps_col, bps_type = pick_latest_from_table(df_value,  [r"BPS"])
     if bps is None:
-        bps, bps_col, bps_type = infer_from_main(df_main, [r"BPS"])  # 주당 값
-
+        bps, bps_col, bps_type = infer_from_main(df_main, [r"BPS"])  # 주당
     ebitda, e_col, e_type = pick_latest_from_table(df_profit, [r"EBITDA"])
     if ebitda is None:
         ebitda, e_col, e_type = infer_from_main(df_main, [r"EBITDA"])
-
     # FCF₀: value의 FCF 우선, 없으면 fs에서 CFO/CAPEX로 계산
     fcf0, fcf_col, fcf_type = pick_latest_from_table(df_value, [r"FCF|Free\s*Cash\s*Flow"])
     if fcf0 is None:
         cfo, cfo_col, _ = pick_latest_from_table(df_fs, [r"영업활동.*현금흐름|영업활동으로인한현금흐름|CFO"])
         capex, capex_col, _ = pick_latest_from_table(df_fs, [r"유형자산의\s*취득|CAPEX|설비투자|유형자산.*취득"])
         if cfo is not None and capex is not None:
-            # CAPEX가 음수(유출)면 그대로 더하는 형태가 자연스러움
-            fcf0 = float(cfo) + float(capex)
+            fcf0 = float(cfo) + float(capex)  # CAPEX 음수(유출) 고려
             fcf_col = f"CFO[{cfo_col}] + CAPEX[{capex_col}]"
             fcf_type = 'derived'
-
     meta_cols = {
         'shares_col': shares_col, 'shares_type': shares_used,
         'net_debt_col': nd_col, 'net_debt_type': nd_used,
@@ -350,16 +337,7 @@ def extract_core_numbers(df_main, df_fs, df_profit, df_value):
         'ebitda_col': e_col, 'ebitda_type': e_type,
         'fcf_col': fcf_col, 'fcf_type': fcf_type,
     }
-
-    return {
-        "shares": shares,
-        "net_debt": net_debt,
-        "eps": eps,
-        "bps": bps,
-        "ebitda": ebitda,
-        "fcf0": fcf0,
-        "meta_cols": meta_cols,
-    }
+    return {"shares": shares, "net_debt": net_debt, "eps": eps, "bps": bps, "ebitda": ebitda, "fcf0": fcf0, "meta_cols": meta_cols}
 
 # ──────────────────────────────────────────────────────────────
 # Valuation 엔진
@@ -385,18 +363,15 @@ def dcf_fair_price(fcf0, g_high, g_mid, g_low, g_tv, r, shares, net_debt, safety
     detail = pd.DataFrame({"Year": years + ["TV"], "FCF": fcfs + [np.nan], "Discount": disc + [disc[-1]], "PV": pv_fcfs + [pv_tv]})
     return float(target), float(ev), float(equity), detail
 
-
 def per_price(eps, per, safety=0.0):
     if eps is None or per is None:
         return None
     return float(eps * per * (1.0 - (safety or 0.0)))
 
-
 def pbr_price(bps, pbr, safety=0.0):
     if bps is None or pbr is None:
         return None
     return float(bps * pbr * (1.0 - (safety or 0.0)))
-
 
 def evebitda_price(ebitda, ev_ebitda, shares, net_debt, safety=0.0):
     if ebitda is None or ev_ebitda is None or not shares:
@@ -411,7 +386,7 @@ def evebitda_price(ebitda, ev_ebitda, shares, net_debt, safety=0.0):
 # ──────────────────────────────────────────────────────────────
 
 st.title("📈 적정주가 계산기 · 최종본")
-st.caption("현재가는 직접 입력하고, 나머지는 자동으로 수집·계산합니다. 예상치가 있으면 우선 적용합니다.")
+st.caption("현재가는 직접 입력하고, 나머지는 자동 수집·계산합니다. 예상치가 있으면 우선 적용합니다.")
 
 with st.sidebar:
     st.header("입력")
@@ -422,7 +397,6 @@ with st.sidebar:
     st.header("시나리오")
     if 'scenario' not in st.session_state:
         st.session_state['scenario'] = '기준'
-
     colS1, colS2, colS3 = st.columns(3)
     if colS1.button("보수"):
         st.session_state['scenario'] = '보수'
@@ -432,7 +406,6 @@ with st.sidebar:
         st.session_state['scenario'] = '낙관'
     st.write(f"선택된 시나리오: **{st.session_state['scenario']}**")
 
-    # 기본 파라미터 (시나리오에 따라 값 세팅)
     def scenario_params(name: str):
         if name == '보수':
             return dict(g_high=0.08, g_mid=0.05, g_low=0.03, g_tv=0.02, r=0.10, safety=0.35)
@@ -531,7 +504,7 @@ if run:
         "방법": ["DCF", "PER", "PBR", "EV/EBITDA", "MIX(가중)"],
         "적정주가": [px_dcf, px_per, px_pbr, px_ev, mix_price],
     })
-    fig = safe_bar(summary, "방법", "적정주가", title="방법별 적정주가")
+    fig = safe_bar_go(summary, "방법", "적정주가", title="방법별 적정주가")
     if fig is None:
         st.info("표시할 적정주가 값이 없습니다.")
     else:
