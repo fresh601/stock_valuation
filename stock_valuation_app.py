@@ -77,36 +77,101 @@ def detect_unit_multiplier_from_html(html_table: str) -> float:
     return 1.0
 
 def fetch_main(cmp_cd, enc, cid):
-    url="https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx"
-    r=requests.get(url,params={'cmp_cd':cmp_cd,'fin_typ':'0','freq_typ':'Y','encparam':enc,'id':cid},timeout=20)
-    r.raise_for_status()
-    soup=BeautifulSoup(r.text,"html.parser")
-    tb = next((t for t in soup.select("table.gHead01.all-width") if re.search(r"20\d{2}", t.get_text(" "))), None)
-    if tb is None: raise ValueError("연간 주요재무정보 테이블을 찾지 못했습니다.")
-    main_mul = detect_unit_multiplier_from_html(str(tb))
+    """
+    main_wide(연간 주요재무정보) 테이블을 가져온다.
+    - 정식 헤더/리퍼러 사용
+    - 연간 테이블 탐색 로직을 유연화
+    - 실패 시 예외를 던지지 않고 (빈 df, 1.0) 반환
+    """
+    url = "https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx"
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={cmp_cd}",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    params = {
+        "cmp_cd": cmp_cd,
+        "fin_typ": "0",   # 연결
+        "freq_typ": "Y",  # 연간
+        "encparam": enc,
+        "id": cid,
+    }
 
-    thead=tb.select("thead tr")
-    year_cells = thead[-1].find_all(["th","td"]) if thead else []
-    years=[]; counter={}
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=20)
+        res.raise_for_status()
+    except Exception:
+        # 실패 시 빈 df 반환
+        return pd.DataFrame(), 1.0
+
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    # 후보 테이블 전부 수집
+    cands = soup.select("table.gHead01.all-width") or soup.find_all("table")
+    target = None
+
+    def looks_like_year_table(tb):
+        txt = clean_text(tb.get_text(" "))
+        # 연도/연간 신호가 있으면 가점
+        if re.search(r"20\d{2}", txt):  # 2019, 2020, ...
+            return True
+        if "연간" in txt:
+            return True
+        # 헤더 열이 여러 개면 가점
+        thead = tb.select_one("thead")
+        if thead:
+            ths = thead.find_all(["th", "td"])
+            if len(ths) >= 5:
+                return True
+        return False
+
+    for tb in cands:
+        if looks_like_year_table(tb):
+            target = tb
+            break
+
+    if target is None:
+        # 못 찾으면 빈 df 반환 (예외 X)
+        return pd.DataFrame(), 1.0
+
+    # 표 단위(원/억원/조원 등) 감지
+    main_mul = detect_unit_multiplier_from_html(str(target))
+
+    # 헤더 추출(중복 컬럼명 방지)
+    thead_rows = target.select("thead tr")
+    year_cells = thead_rows[-1].find_all(["th", "td"]) if thead_rows else []
+    years, counter = [], {}
     for th in year_cells:
-        t=clean_text(th.get_text(" "))
-        if t and not re.search(r"구분|주요재무정보",t):
-            counter[t]=counter.get(t,0)+1
-            years.append(t + (f"_{counter[t]}" if counter[t]>1 else ""))
+        t = clean_text(th.get_text(" "))
+        if t and not re.search(r"구분|주요재무정보", t):
+            counter[t] = counter.get(t, 0) + 1
+            years.append(t + (f"_{counter[t]}" if counter[t] > 1 else ""))
 
-    rows=[]
-    for tr in tb.select("tbody tr"):
-        th=tr.find("th")
-        if not th: continue
-        metric=clean_text(th.get_text(" "))
-        tds=tr.find_all("td")
-        vals=[]
+    # 본문
+    rows = []
+    for tr in target.select("tbody tr"):
+        th = tr.find("th")
+        if not th:
+            continue
+        metric = clean_text(th.get_text(" "))
+        tds = tr.find_all("td")
+        vals = []
         for i in range(len(years)):
-            raw = (tds[i].get("title") if i<len(tds) else None) or (clean_text(tds[i].get_text(" ")) if i<len(tds) else None)
+            cell = tds[i] if i < len(tds) else None
+            raw = (cell.get("title") if cell else None) or (clean_text(cell.get_text(" ")) if cell else None)
             vals.append(to_number(raw))
-        rows.append([metric]+vals)
-    df=pd.DataFrame(rows,columns=["지표"]+years).set_index("지표")
+        rows.append([metric] + vals)
+
+    if not rows or not years:
+        # 구조는 있으나 실데이터가 비어있는 경우도 방어
+        return pd.DataFrame(), main_mul
+
+    df = pd.DataFrame(rows, columns=["지표"] + years).set_index("지표")
     return df, main_mul
+
 
 # ───────────────────────────────
 # JSON 모드 수집 + 단위 스케일 적용
@@ -355,10 +420,15 @@ if run:
         st.stop()
 
     with st.spinner("데이터 수집(main/fs/profit/value)..."):
-        main, main_mul = fetch_main(cmp, enc, cid)
-        fs    = fetch_json(cmp, "fs", enc)
-        prof  = fetch_json(cmp, "profit", enc)
-        value = fetch_json(cmp, "value", enc)
+    main, main_mul = fetch_main(cmp, enc, cid)
+    fs    = fetch_json(cmp, "fs", enc)
+    prof  = fetch_json(cmp, "profit", enc)
+    value = fetch_json(cmp, "value", enc)
+
+    if main is None or main.empty:
+        st.warning("main_wide(연간 주요재무정보) 표를 찾지 못했습니다. FCF₀ 1차 소스(main)는 생략하고 value/파생으로 시도합니다.")
+        # main이 없어도 진행 가능한 파트(DCF/EV/...)는 value/prof/fs로 계산 유지
+
 
     # 핵심 값 추출 + META
     meta = {"main_mul": main_mul}
