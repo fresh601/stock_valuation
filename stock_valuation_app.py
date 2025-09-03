@@ -698,22 +698,22 @@ if run:
     )
 # -------------------------------------------------------------------------
 
-     if isinstance(dcf_detail, pd.DataFrame) and not dcf_detail.empty:
-       st.subheader("🔍 DCF 상세 (연도별 FCF / 할인계수 / 현재가치)")
+    if isinstance(dcf_detail, pd.DataFrame) and not dcf_detail.empty:
+      st.subheader("🔍 DCF 상세 (연도별 FCF / 할인계수 / 현재가치)")
     
         # 표시용 컬럼(누적 PV 추가)
-       df_show = dcf_detail.copy()
-       if "PV" in df_show.columns:
-           df_show["누적PV"] = df_show["PV"].cumsum()
+      df_show = dcf_detail.copy()
+      if "PV" in df_show.columns:
+        df_show["누적PV"] = df_show["PV"].cumsum()
     
         # 숫자 포맷 함수
-       def _fmt(v, nd=0):
-           if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
-               return ""
-           try:
-               return f"{float(v):,.{nd}f}"
-           except Exception:
-               return str(v)
+      def _fmt(v, nd=0):
+        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+          return ""
+        try:
+          return f"{float(v):,.{nd}f}"
+        except Exception:
+          return str(v)
     
         # 화면용 테이블 만들기 (필요 컬럼만 선택)
        cols = []
