@@ -716,7 +716,7 @@ if run:
         'scenario': st.session_state['scenario'],
         'params': dict(g_high=g_high, g_mid=g_mid, g_low=g_low, g_tv=g_tv, r=r, safety=safety),
         'multiples': dict(PER=per_mult, PBR=pbr_mult, EV_EBITDA=ev_mult),
-        'weights': dict(DCF=w_dcf, PER=w_per, PBR=w_pbr, EVEBITDA=w_ev, sum=wsum),
+        'weights': dict(DCF=w_dcf, PER=w_per, PBR=w_pbr, EVEBITDA=w_ev),
         'selected_cols': core['meta_cols'],
     }
 
