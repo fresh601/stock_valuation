@@ -106,54 +106,44 @@ def pick_prefer_current_then_estimate(row: pd.Series):
 # 안전 차트(Plotly graph_objects)
 # ──────────────────────────────────────────────────────────────
 
+import pandas as pd
+import plotly.graph_objects as go
+
 def safe_bar_go(df: pd.DataFrame, x: str, y: str, title: str = None, eps: float = 1e-9):
     """
     안전하게 막대 그래프를 만드는 함수
     - df: 데이터프레임
-    - x : x축에 쓸 컬럼명
-    - y : y축에 쓸 컬럼명
+    - x : x축 컬럼명
+    - y : y축 컬럼명
     - title : 그래프 제목
-    - eps : 임계치(이 값보다 작은 수는 0으로 간주하고 숨김)
+    - eps : 임계치(이 값보다 작은 절댓값은 0으로 간주하고 숨김)
     """
-
-    # 1. 원본을 보호하기 위해 복사
     df2 = df.copy()
-
-    # 2. y 컬럼을 숫자로 변환 (문자 → 숫자, 변환 불가는 NaN 처리)
     df2[y] = pd.to_numeric(df2[y], errors='coerce')
-
-    # 3. 너무 작은 값(절댓값이 eps보다 작은 값)은 NaN 처리 → 그래프에서 안 보이게 함
+    # 거의 0에 수렴하는 값은 NaN 처리 → 막대 숨김
     df2.loc[df2[y].abs() < eps, y] = pd.NA
-
-    # 4. y값이 NaN인 행 제거
     df2 = df2.dropna(subset=[y])
-
-    # 5. 만약 다 지워져서 데이터가 없으면 None 반환 (그래프 없음)
     if df2.empty:
         return None
 
-    # 6. 리스트로 변환 (plotly에 넣기 편하게)
     x_vals = df2[x].astype(str).tolist()
     y_vals = df2[y].astype(float).tolist()
 
-    # 7. plotly 막대 그래프 생성
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=x_vals,
         y=y_vals,
-        text=[f"{val:,.2f}" for val in y_vals],  # 막대 위에 값 표시
+        text=[f"{v:,.2f}" for v in y_vals],
         textposition="auto"
     ))
-
-    # 8. 제목과 레이아웃 설정
     fig.update_layout(
         title=title or "",
         xaxis_title=x,
         yaxis_title=y,
         template="plotly_white"
     )
-
     return fig
+
 
 # ──────────────────────────────────────────────────────────────
 # Selenium: encparam / id
@@ -436,6 +426,88 @@ def evebitda_price(ebitda, ev_ebitda, shares, net_debt, safety=0.0):
     per_share = equity / shares
     return float(per_share * (1.0 - (safety or 0.0)))
 
+
+def fair_price_ev_ebitda(ev_multiple: float,
+                         ebitda: float | None,
+                         net_debt: float | None,
+                         shares_out: float | None) -> float | None:
+    """EBITDA 없거나 ≤0, 주식수 ≤0이면 계산 중단."""
+    if ebitda is None or not np.isfinite(ebitda) or ebitda <= 0:
+        return None
+    if net_debt is None or not np.isfinite(net_debt):
+        net_debt = 0.0
+    if shares_out is None or not np.isfinite(shares_out) or shares_out <= 0:
+        return None
+    ev_fair = float(ev_multiple) * float(ebitda)
+    equity_fair = ev_fair - float(net_debt)
+    px = equity_fair / float(shares_out)
+    return float(px) if np.isfinite(px) else None
+
+
+
+def _pick_latest_numeric_row(row, prefer_col: str | None = None):
+    if prefer_col and prefer_col in row.index:
+        v = pd.to_numeric(row.get(prefer_col), errors='coerce')
+        if pd.notna(v):
+            return float(v)
+    for col in reversed(row.index[1:]):  # 오른쪽(최신)부터
+        v = pd.to_numeric(row.get(col), errors='coerce')
+        if pd.notna(v):
+            return float(v)
+    return np.nan
+
+def resolve_fcf0(tbl_cashflow: pd.DataFrame | None,
+                 tbl_profit: pd.DataFrame | None = None,
+                 prefer_col: str | None = None) -> float | None:
+    """
+    1) 현금흐름표에서 FCF(자유/잉여현금흐름/FCF) 직접 탐색
+    2) 없으면 근사: (영업활동현금흐름 - 유형자산취득(|절댓값|))
+    """
+    if tbl_cashflow is not None and not tbl_cashflow.empty:
+        df = tbl_cashflow.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        label_col = df.columns[0]
+
+        pat_fcf = r'(free\s*cash\s*flow|fcf|자유\s*현금\s*흐름|잉여\s*현금\s*흐름)'
+        m_fcf = df[label_col].astype(str).str.contains(pat_fcf, flags=re.I, regex=True, na=False)
+        if m_fcf.any():
+            v = df.loc[m_fcf].apply(lambda r: _pick_latest_numeric_row(r, prefer_col), axis=1).dropna()
+            if not v.empty and np.isfinite(v.iloc[0]):
+                return float(v.iloc[0])
+
+        pat_cfo   = r'(영업활동현금흐름|영업활동으로인한현금흐름|CFO\b)'
+        pat_capex = r'(유형자산[의]*\s*취득|CAPEX|유형자산의취득|유형자산취득)'
+        m_cfo   = df[label_col].astype(str).str.contains(pat_cfo, flags=re.I, regex=True, na=False)
+        m_capex = df[label_col].astype(str).str.contains(pat_capex, flags=re.I, regex=True, na=False)
+
+        def _pick(mask):
+            if not mask.any(): return np.nan
+            row = df.loc[mask].iloc[0]
+            return _pick_latest_numeric_row(row, prefer_col)
+
+        cfo   = _pick(m_cfo)
+        capex = _pick(m_capex)
+        if np.isfinite(cfo):
+            capex = abs(capex) if np.isfinite(capex) else np.nan
+            return float(cfo - (capex if np.isfinite(capex) else 0.0))
+
+    if tbl_profit is not None and not tbl_profit.empty:
+        df = tbl_profit.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        label_col = df.columns[0]
+        m = df[label_col].astype(str).str.contains(
+            r'(free\s*cash\s*flow|fcf|자유\s*현금\s*흐름|잉여\s*현금\s*흐름)',
+            flags=re.I, regex=True, na=False
+        )
+        if m.any():
+            v = df.loc[m].apply(lambda r: _pick_latest_numeric_row(r, prefer_col), axis=1).dropna()
+            if not v.empty and np.isfinite(v.iloc[0]):
+                return float(v.iloc[0])
+
+    return None
+
+
+
 # ──────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────
@@ -537,14 +609,20 @@ if run:
     if core.get("shares") in (None, 0, np.nan): missing.append("주식수")
     if r in (None, 0, np.nan): missing.append("할인율 r")
     if missing:
-        st.warning("DCF 계산이 비활성화된 이유: " + ", ".join(missing))
+      st.warning("DCF 계산이 비활성화된 이유: " + ", ".join(missing))
+    if core.get("fcf0") is None:
+      core["fcf0"] = resolve_fcf0(tbl_cashflow=df_fs, tbl_profit=df_profit, prefer_col=None)
 
     # Valuation
     px_dcf, ev, equity, dcf_detail = dcf_fair_price(core["fcf0"], g_high, g_mid, g_low, g_tv, r, core["shares"], core["net_debt"], safety)
     px_per = per_price(core["eps"], per_mult, safety=safety)
     px_pbr = pbr_price(core["bps"], pbr_mult, safety=safety)
-    px_ev  = evebitda_price(core["ebitda"], ev_mult, core["shares"], core["net_debt"], safety=safety)
 
+    px_ev  = fair_price_ev_ebitda(ev_multiple=ev_mult,
+                              ebitda=core["ebitda"],
+                              net_debt=core["net_debt"],
+                              shares_out=core["shares"])
+  
     wsum = (w_dcf + w_per + w_pbr + w_ev) or 1.0
     parts = [px * (w / wsum) for px, w in [(px_dcf,w_dcf),(px_per,w_per),(px_pbr,w_pbr),(px_ev,w_ev)] if px is not None]
     mix_price = float(np.nansum(parts)) if parts else None
