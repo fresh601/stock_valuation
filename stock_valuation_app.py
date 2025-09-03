@@ -614,18 +614,81 @@ if run:
       core["fcf0"] = resolve_fcf0(tbl_cashflow=df_fs, tbl_profit=df_profit, prefer_col=None)
 
     # Valuation
-    px_dcf, ev, equity, dcf_detail = dcf_fair_price(core["fcf0"], g_high, g_mid, g_low, g_tv, r, core["shares"], core["net_debt"], safety)
-    px_per = per_price(core["eps"], per_mult, safety=safety)
-    px_pbr = pbr_price(core["bps"], pbr_mult, safety=safety)
+    # --- Valuation (정규화 + 가드 버전) ---------------------------------------
 
-    px_ev  = fair_price_ev_ebitda(ev_multiple=ev_mult,
-                              ebitda=core["ebitda"],
-                              net_debt=core["net_debt"],
-                              shares_out=core["shares"])
-  
-    wsum = (w_dcf + w_per + w_pbr + w_ev) or 1.0
-    parts = [px * (w / wsum) for px, w in [(px_dcf,w_dcf),(px_per,w_per),(px_pbr,w_pbr),(px_ev,w_ev)] if px is not None]
-    mix_price = float(np.nansum(parts)) if parts else None
+def _to_float(x, default=None):
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return default
+        if isinstance(x, str):
+            x = x.replace(",", "").strip()
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+def _rate(x):
+    """퍼센트로 들어오면 소수로 변환(예: 9 → 0.09), 이미 소수면 그대로."""
+    v = _to_float(x, default=None)
+    if v is None:
+        return None
+    return v/100.0 if v > 1.0 else v
+
+def _clamp_r_gt_g(r0, g0, eps=1e-4):
+    """DCF 성립 조건(r > g_tv) 보장."""
+    if r0 is None or g0 is None:
+        return r0, g0
+    return (r0, min(g0, r0 - eps)) if r0 <= g0 else (r0, g0)
+
+# 0) 코어 입력 정규화
+fcf0     = _to_float(core.get("fcf0"))
+ebitda   = _to_float(core.get("ebitda"))
+shares   = _to_float(core.get("shares"))
+net_debt = _to_float(core.get("net_debt"), default=0.0)
+
+# 1) 성장률/할인율 정규화(퍼센트 → 소수) + r>g_tv 보정
+r_n      = _rate(r)
+gH, gM, gL = _rate(g_high), _rate(g_mid), _rate(g_low)
+g_tv_n   = _rate(g_tv)
+r_n, g_tv_n = _clamp_r_gt_g(r_n, g_tv_n)
+
+# 2) EV/EBITDA 배수 정규화
+ev_mult_n = _to_float(ev_mult)
+ev_mult_n = ev_mult_n if (ev_mult_n is not None and ev_mult_n > 0) else None
+
+# 3) DCF 계산 (기존 함수 사용)
+px_dcf, ev, equity, dcf_detail = dcf_fair_price(
+    fcf0=fcf0,
+    g_high=gH, g_mid=gM, g_low=gL,
+    g_tv=g_tv_n, r=r_n,
+    shares=shares, net_debt=net_debt, safety=safety
+)
+
+# 4) PER/PBR (기존 그대로)
+px_per = per_price(core["eps"], per_mult, safety=safety)
+px_pbr = pbr_price(core["bps"], pbr_mult, safety=safety)
+
+# 5) EV/EBITDA 가드 버전 사용(이미 4-2로 추가해 둔 함수)
+px_ev  = fair_price_ev_ebitda(
+    ev_multiple=ev_mult_n,
+    ebitda=ebitda,
+    net_debt=net_debt,
+    shares_out=shares
+)
+
+# 6) MIX 재가중(값 있는 항목만)
+pairs = [(px_dcf, w_dcf), (px_per, w_per), (px_pbr, w_pbr), (px_ev, w_ev)]
+use_wsum = sum(w for px, w in pairs if px is not None) or 1.0
+mix_price = (float(np.nansum([px * (w / use_wsum) for px, w in pairs if px is not None]))
+             if any(px is not None for px, _ in pairs) else None)
+
+# (선택) 디버그 캡션: 계산 직전 값 점검
+st.caption(
+    f"DBG ▶ shares={shares}, r={r_n}, g_tv={g_tv_n}, ev_mult={ev_mult_n}, "
+    f"FCF0={fcf0}, EBITDA={ebitda}, DCF_px={px_dcf}, EV/EBITDA_px={px_ev}"
+)
+# -------------------------------------------------------------------------
+
 
     st.subheader("📌 적정주가 요약")
     summary = pd.DataFrame({"방법": ["DCF", "PER", "PBR", "EV/EBITDA", "MIX(가중)"], "적정주가": [px_dcf, px_per, px_pbr, px_ev, mix_price]})
