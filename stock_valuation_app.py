@@ -645,6 +645,15 @@ if run:
     ebitda   = _to_float(core.get("ebitda"))
     shares   = _to_float(core.get("shares"))
     net_debt = _to_float(core.get("net_debt"), default=0.0)
+
+
+  # 단위 환산: 엑셀은 '억원' 단위 → 원 단위로 변환
+    UNIT = 1e8
+    if fcf0 is not None:
+        fcf0 *= UNIT
+    if ebitda is not None:
+        ebitda *= UNIT
+
     
     # 1) 성장률/할인율 정규화(퍼센트 → 소수) + r>g_tv 보정
     r_n      = _rate(r)
