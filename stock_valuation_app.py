@@ -40,7 +40,7 @@ UNIT_MAP = {
     '원': 1.0,
     '천원': 1e3,
     '만원': 1e4,
-    '백만원': 1e8,   # 공급 포맷 혼재 대비(표 단위 문자열을 기준으로 환산)
+    '백만원': 1e6,   # 공급 포맷 혼재 대비(표 단위 문자열을 기준으로 환산)
     '억원': 1e8,
     '십억원': 1e9,
     '백억원': 1e10,
@@ -106,19 +106,53 @@ def pick_prefer_current_then_estimate(row: pd.Series):
 # 안전 차트(Plotly graph_objects)
 # ──────────────────────────────────────────────────────────────
 
-def safe_bar_go(df: pd.DataFrame, x: str, y: str, title: str = None):
-    df2 = df.dropna(subset=[y]).copy()
-    if df2.empty:
-        return None
+def safe_bar_go(df: pd.DataFrame, x: str, y: str, title: str = None, eps: float = 1e-9):
+    """
+    안전하게 막대 그래프를 만드는 함수
+    - df: 데이터프레임
+    - x : x축에 쓸 컬럼명
+    - y : y축에 쓸 컬럼명
+    - title : 그래프 제목
+    - eps : 임계치(이 값보다 작은 수는 0으로 간주하고 숨김)
+    """
+
+    # 1. 원본을 보호하기 위해 복사
+    df2 = df.copy()
+
+    # 2. y 컬럼을 숫자로 변환 (문자 → 숫자, 변환 불가는 NaN 처리)
     df2[y] = pd.to_numeric(df2[y], errors='coerce')
+
+    # 3. 너무 작은 값(절댓값이 eps보다 작은 값)은 NaN 처리 → 그래프에서 안 보이게 함
+    df2.loc[df2[y].abs() < eps, y] = pd.NA
+
+    # 4. y값이 NaN인 행 제거
     df2 = df2.dropna(subset=[y])
+
+    # 5. 만약 다 지워져서 데이터가 없으면 None 반환 (그래프 없음)
     if df2.empty:
         return None
+
+    # 6. 리스트로 변환 (plotly에 넣기 편하게)
     x_vals = df2[x].astype(str).tolist()
     y_vals = df2[y].astype(float).tolist()
-    text_vals = [f"{v:.2f}" if v is not None and not np.isnan(v) else "" for v in y_vals]
-    fig = go.Figure(data=[go.Bar(x=x_vals, y=y_vals, text=text_vals, textposition="outside")])
-    fig.update_layout(title=title or "", uniformtext_minsize=8, uniformtext_mode="show", margin=dict(t=40, r=20, l=20, b=50), xaxis_title=x, yaxis_title=y)
+
+    # 7. plotly 막대 그래프 생성
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=x_vals,
+        y=y_vals,
+        text=[f"{val:,.2f}" for val in y_vals],  # 막대 위에 값 표시
+        textposition="auto"
+    ))
+
+    # 8. 제목과 레이아웃 설정
+    fig.update_layout(
+        title=title or "",
+        xaxis_title=x,
+        yaxis_title=y,
+        template="plotly_white"
+    )
+
     return fig
 
 # ──────────────────────────────────────────────────────────────
@@ -380,7 +414,8 @@ def dcf_fair_price(fcf0, g_high, g_mid, g_low, g_tv, r, shares, net_debt, safety
     equity = ev - (net_debt or 0.0)
     per_share = equity / shares
     target = per_share * (1.0 - (safety or 0.0))
-    detail = pd.DataFrame({"Year": years + ["TV"], "FCF": fcfs + [np.nan], "Discount": disc + [disc[-1]], "PV": pv_fcfs + [pv_tv]})
+    tv_fcf_display = fcfs[-1] * (1.0 + g_tv) if np.isfinite(tv) else np.nan
+    detail = pd.DataFrame({"Year": years + ["TV"], "FCF": fcfs + [tv_fcf_display], "Discount": disc + [disc[-1]], "PV": pv_fcfs + [pv_tv]})
     return float(target), float(ev), float(equity), detail
 
 def per_price(eps, per, safety=0.0):
