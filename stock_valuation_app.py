@@ -778,37 +778,5 @@ if run:
     up = None if not current_price or not mix_price else (mix_price / current_price - 1.0) * 100.0
     col3.metric("상승여력", f"{up:.2f}%" if up is not None else "-")
 
-    st.subheader("DCF 세부내역")
-    if dcf_detail is not None:
-        st.dataframe(dcf_detail, use_container_width=True)
-    else:
-        st.info("DCF 계산을 위해 FCF₀/주식수/할인율이 필요합니다.")
-
-    # 결과 엑셀 생성
-    meta = {
-        'ticker': cmp_cd,
-        'scenario': st.session_state['scenario'],
-        'params': dict(g_high=g_high, g_mid=g_mid, g_low=g_low, g_tv=g_tv, r=r, safety=safety),
-        'multiples': dict(PER=per_mult, PBR=pbr_mult, EV_EBITDA=ev_mult),
-        'weights': dict(DCF=w_dcf, PER=w_per, PBR=w_pbr, EVEBITDA=w_ev),
-        'selected_cols': core['meta_cols'],
-    }
-
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as wr:
-        summary.to_excel(wr, sheet_name="SUMMARY", index=False)
-        pd.DataFrame([{'현재가': current_price, '적정가(MIX)': mix_price, '상승여력%': up}]).to_excel(wr, sheet_name="PRICE", index=False)
-        pd.DataFrame([{'발행주식수(주)': core['shares'], '순부채(원)': core['net_debt'], 'EPS': core['eps'], 'BPS': core['bps'], 'EBITDA(원)': core['ebitda'], 'FCF₀(원)': core['fcf0']}]).to_excel(wr, sheet_name="CORE_INPUTS", index=False)
-        try:
-            df_main.reset_index().to_excel(wr, sheet_name="MAIN_SNAPSHOT", index=False)
-            df_fs.to_excel(wr, sheet_name="FS_SNAPSHOT", index=False)
-            df_profit.to_excel(wr, sheet_name="PROFIT_SNAPSHOT", index=False)
-            df_value.to_excel(wr, sheet_name="VALUE_SNAPSHOT", index=False)
-        except Exception:
-            pass
-        pd.DataFrame([meta]).to_excel(wr, sheet_name="META", index=False)
-
-    st.download_button("결과 엑셀 다운로드", data=out.getvalue(), file_name=f"{cmp_cd}_valuation_final.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
 else:
     st.info("좌측에서 종목코드·현재가를 입력하고 ‘자동 수집 → 계산’을 눌러주세요.")
