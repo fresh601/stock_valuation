@@ -700,60 +700,67 @@ if run:
 
     if isinstance(dcf_detail, pd.DataFrame) and not dcf_detail.empty:
       st.subheader("🔍 DCF 상세 (연도별 FCF / 할인계수 / 현재가치)")
-    
-        # 표시용 컬럼(누적 PV 추가)
+  
+      # 표시용 컬럼(누적 PV 추가)
       df_show = dcf_detail.copy()
       if "PV" in df_show.columns:
-        df_show["누적PV"] = df_show["PV"].cumsum()
-    
-        # 숫자 포맷 함수
+          df_show["누적PV"] = df_show["PV"].cumsum()
+  
+      # 숫자 포맷 함수
       def _fmt(v, nd=0):
-        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
-          return ""
-        try:
-          return f"{float(v):,.{nd}f}"
-        except Exception:
-          return str(v)
-    
-        # 화면용 테이블 만들기 (필요 컬럼만 선택)
-       cols = []
-       if "Year" in df_show.columns:     cols.append(("Year", "Year"))
-       if "FCF" in df_show.columns:      cols.append(("FCF", "FCF(원)"))
-       if "Discount" in df_show.columns: cols.append(("Discount", "Discount"))
-       if "PV" in df_show.columns:       cols.append(("PV", "PV(원)"))
-       if "누적PV" in df_show.columns:   cols.append(("누적PV", "누적PV(원)"))
-    
-       df_disp = pd.DataFrame({
-           new: (
-               df_show[old].apply(lambda v: _fmt(v, 4)) if old == "Discount"
-               else df_show[old].apply(lambda v: _fmt(v, 0))
-           ) if old in df_show.columns else []
-           for (old, new) in cols
-       })
-    
-       st.dataframe(df_disp, use_container_width=True, hide_index=True)
-    
-       # 다운로드(원본 dcf_detail 및 표시용 df_disp 둘 다 포함)
-       buf = io.BytesIO()
-       with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-           dcf_detail.to_excel(writer, index=False, sheet_name="DCF_Detail_Raw")
-           df_disp.to_excel(writer, index=False, sheet_name="DCF_Detail_Display")
-       st.download_button(
-           "📥 DCF 상세(Excel, 원본+표시용)",
-           data=buf.getvalue(),
-           file_name="dcf_detail.xlsx",
-           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-           use_container_width=True,
-       )
-       st.download_button(
-           "📥 DCF 상세(CSV, 원본)",
-           data=dcf_detail.to_csv(index=False).encode("utf-8-sig"),
-           file_name="dcf_detail.csv",
-           mime="text/csv",
-           use_container_width=True,
-       )
+          if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+              return ""
+          try:
+              return f"{float(v):,.{nd}f}"
+          except Exception:
+              return str(v)
+  
+      # 화면용 테이블 만들기 (필요 컬럼만 선택)
+      cols = []
+      if "Year" in df_show.columns:
+          cols.append(("Year", "Year"))
+      if "FCF" in df_show.columns:
+          cols.append(("FCF", "FCF(원)"))
+      if "Discount" in df_show.columns:
+          cols.append(("Discount", "Discount"))
+      if "PV" in df_show.columns:
+          cols.append(("PV", "PV(원)"))
+      if "누적PV" in df_show.columns:
+          cols.append(("누적PV", "누적PV(원)"))
+  
+      df_disp = pd.DataFrame({
+          new: (
+              df_show[old].apply(lambda v: _fmt(v, 4)) if old == "Discount"
+              else df_show[old].apply(lambda v: _fmt(v, 0))
+          ) if old in df_show.columns else []
+          for (old, new) in cols
+      })
+  
+      st.dataframe(df_disp, use_container_width=True, hide_index=True)
+  
+      # 다운로드(원본 dcf_detail 및 표시용 df_disp 둘 다 포함)
+      buf = io.BytesIO()
+      with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+          dcf_detail.to_excel(writer, index=False, sheet_name="DCF_Detail_Raw")
+          df_disp.to_excel(writer, index=False, sheet_name="DCF_Detail_Display")
+  
+      st.download_button(
+          "📥 DCF 상세(Excel, 원본+표시용)",
+          data=buf.getvalue(),
+          file_name="dcf_detail.xlsx",
+          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          use_container_width=True,
+      )
+      st.download_button(
+          "📥 DCF 상세(CSV, 원본)",
+          data=dcf_detail.to_csv(index=False).encode("utf-8-sig"),
+          file_name="dcf_detail.csv",
+          mime="text/csv",
+          use_container_width=True,
+      )
     else:
-        st.info("DCF 상세표를 표시할 데이터가 없습니다.")
+      st.info("DCF 상세표를 표시할 데이터가 없습니다.")
+
 
 
   
