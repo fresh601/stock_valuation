@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-네이버(와이즈리포트) 자동 수집 + 적정주가 계산기 (Final Version)
-- 개선점: 현재가 자동 수집, 단위 중복 계산 수정, Selenium 안정성 강화, 중복 함수 제거
+네이버(와이즈리포트) 자동 수집 + 적정주가 계산 최종본 (Streamlit Cloud 수정버전)
 """
 
 import io
 import re
 import time
 import json
+import os  # [추가] 클라우드 경로 확인용
 import numpy as np
 import pandas as pd
 import requests
@@ -17,12 +17,13 @@ from collections import defaultdict
 import plotly.graph_objects as go
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service # [추가]
+from selenium.webdriver.common.by import By # [추가]
 
-st.set_page_config(page_title="적정주가 계산기 · Final", layout="wide")
+st.set_page_config(page_title="적정주가 계산기 · 최종본", layout="wide")
 
 # ──────────────────────────────────────────────────────────────
-# 1. 유틸리티 & 단위 변환
+# 유틸리티 (원본 유지)
 # ──────────────────────────────────────────────────────────────
 UNIT_MAP = {
     '원': 1.0, '천원': 1e3, '만원': 1e4,
@@ -38,118 +39,140 @@ def to_number(s):
     m = re.fullmatch(r"\(([-+]?\d*\.?\d+)\)", s)
     if m: return -float(m.group(1))
     try: return float(s)
-    except: return None
+    except Exception: return None
 
 def clean_text(x: str) -> str:
     return re.sub(r"\s+", " ", (x or "").replace("\xa0", " ").strip())
 
 def scale_by_unit(df: pd.DataFrame, unit_col: str = '단위') -> pd.DataFrame:
-    """표의 '단위' 컬럼을 감지하여 모든 숫자를 '원' 단위로 변환"""
     if df is None or df.empty: return df
-    
-    # 숫자형 컬럼 식별
-    num_cols = [c for c in df.columns if c not in ("항목", "단위", "전년대비 (YoY, %)")]
-    
     if unit_col not in df.columns:
-        # 단위가 없으면 콤마만 제거하고 반환
+        num_cols = [c for c in df.columns if c not in ("항목", "단위", "전년대비 (YoY, %)")]
         df[num_cols] = df[num_cols].replace(",", "", regex=True).apply(pd.to_numeric, errors='coerce')
         return df
-        
     unit_str = str(df[unit_col].iloc[0])
     mul = 1.0
     for k, v in UNIT_MAP.items():
         if k in unit_str:
             mul = v
             break
-            
+    num_cols = [c for c in df.columns if c not in ("항목", "단위", "전년대비 (YoY, %)")]
     df[num_cols] = df[num_cols].replace(",", "", regex=True).apply(pd.to_numeric, errors='coerce') * mul
     return df
 
 def pick_prefer_current_then_estimate(row: pd.Series):
-    """열 선택 우선순위: 당기/최근/TTM -> (E)/예상 -> 가장 오른쪽(최근)"""
     cols = list(row.index)
-    # 1. 확정 실적 (당기/최근/TTM)
     prefer_now = [i for i, c in enumerate(cols) if re.search(r'당기|최근|TTM|12M', str(c), re.I)]
     for i in reversed(prefer_now):
         v = pd.to_numeric(str(row.iloc[i]).replace(',', ''), errors='coerce')
         if pd.notna(v): return float(v), cols[i], 'current'
-    # 2. 컨센서스 (E)
-    prefer_est = [i for i, c in enumerate(cols) if re.search(r'\(E\)|Estimate|예상|FWD', str(c), re.I)]
+    prefer_est = [i for i, c in enumerate(cols) if re.search(r'\(E\)|Estimate|예상|FWD|Forward', str(c), re.I)]
     for i in reversed(prefer_est):
         v = pd.to_numeric(str(row.iloc[i]).replace(',', ''), errors='coerce')
         if pd.notna(v): return float(v), cols[i], 'estimate'
-    # 3. 그 외 가장 최신 데이터
     for i in range(len(cols) - 1, -1, -1):
         v = pd.to_numeric(str(row.iloc[i]).replace(',', ''), errors='coerce')
         if pd.notna(v): return float(v), cols[i], 'actual'
     return None, None, None
 
 # ──────────────────────────────────────────────────────────────
-# 2. Selenium & 크롤링 (현재가 자동 수집 추가)
+# 안전 차트(Plotly graph_objects) (원본 유지)
+# ──────────────────────────────────────────────────────────────
+def safe_bar_go(df: pd.DataFrame, x: str, y: str, title: str = None, eps: float = 1e-9):
+    df2 = df.copy()
+    df2[y] = pd.to_numeric(df2[y], errors='coerce')
+    df2.loc[df2[y].abs() < eps, y] = pd.NA
+    df2 = df2.dropna(subset=[y])
+    if df2.empty: return None
+    x_vals = df2[x].astype(str).tolist()
+    y_vals = df2[y].astype(float).tolist()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=x_vals, y=y_vals,
+        text=[f"{v:,.0f}" for v in y_vals], textposition="auto"
+    ))
+    fig.update_layout(title=title or "", xaxis_title=x, yaxis_title=y, template="plotly_white")
+    return fig
+
+# ──────────────────────────────────────────────────────────────
+# Selenium: encparam / id (여기가 핵심 수정)
 # ──────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def get_encparam_id_price(cmp_cd: str, page_key: str) -> dict:
+def get_encparam_and_id(cmp_cd: str, page_key: str) -> dict:
     chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--disable-gpu")
+    # [필수 수정 1] 헤드리스 및 클라우드용 옵션 추가
+    chrome_options.add_argument("--headless=new") 
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--single-process") # 메모리 부족 방지
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--single-process")
     
-    driver = webdriver.Chrome(options=chrome_options)
-    current_price = 0.0
+    # [필수 수정 2] 스트림릿 클라우드 경로 자동 감지
+    if os.path.exists("/usr/bin/chromium"):
+        chrome_options.binary_location = "/usr/bin/chromium"
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        chrome_options.binary_location = "/usr/bin/chromium-browser"
+
+    driver = None
     try:
+        # Service 객체 사용 (최신 Selenium 권장)
+        service = Service()
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        
         url = f"https://navercomp.wisereport.co.kr/v2/company/{page_key}.aspx?cmp_cd={cmp_cd}"
         driver.get(url)
-        time.sleep(2.0) # 페이지 로딩 대기
+        time.sleep(2.5) # 대기 시간 약간 확보
         
         html = driver.page_source
-        
-        # 1. 암호화 토큰 추출
         enc_match = re.search(r"encparam\s*:\s*['\"]?([a-zA-Z0-9+/=]+)['\"]?", html)
         id_match = re.search(r"cmp_cd\s*=\s*['\"]?([0-9]+)['\"]?", html)
         
-        # 2. 현재가 추출 (WiseReport 상단 배너 or 네이버 금융 구조)
+        # [편의 기능 추가] 기왕 킨 김에 현재가도 긁어오기
+        current_price = 0.0
         try:
-            # WiseReport 팝업 내 상단 현재가 위치 (.cny_head .no_today .blind)
-            price_elem = driver.find_element(By.CSS_SELECTOR, ".cny_head .no_today .blind")
-            if price_elem:
-                current_price = float(price_elem.text.replace(",", ""))
+            # 네이버 금융 페이지 구조에 따른 선택자 시도
+            elem = driver.find_element(By.CSS_SELECTOR, ".cny_head .no_today .blind")
+            if elem:
+                current_price = float(elem.text.replace(",", ""))
         except:
-            current_price = 0.0
+            pass
             
         return {
-            "cmp_cd": cmp_cd,
-            "encparam": enc_match.group(1) if enc_match else None,
+            "cmp_cd": cmp_cd, 
+            "encparam": enc_match.group(1) if enc_match else None, 
             "id": id_match.group(1) if id_match else None,
-            "current_price": current_price
+            "auto_price": current_price
         }
+    except Exception as e:
+        print(f"Selenium Error: {e}")
+        return {"cmp_cd": cmp_cd, "encparam": None, "id": None, "auto_price": 0.0}
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
+# ──────────────────────────────────────────────────────────────
+# 데이터 수집 (원본 유지)
+# ──────────────────────────────────────────────────────────────
 def fetch_main_table(cmp_cd: str, encparam: str, cmp_id: str):
     url = "https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx"
-    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={cmp_cd}'}
-    params = {'cmp_cd': cmp_cd, 'fin_typ': '0', 'freq_typ': 'Y', 'encparam': encparam, 'id': cmp_id}
-    res = requests.get(url, headers=headers, params=params, timeout=10)
+    headers = {'Accept': 'application/json, text/html, */*; q=0.01','User-Agent': 'Mozilla/5.0','X-Requested-With': 'XMLHttpRequest','Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={cmp_cd}'}
+    params = {'cmp_cd': cmp_cd,'fin_typ': '0','freq_typ': 'Y','encparam': encparam,'id': cmp_id}
+    res = requests.get(url, headers=headers, params=params, timeout=20)
     res.raise_for_status()
-    
     soup = BeautifulSoup(res.text, 'html.parser')
     tables = soup.select("table.gHead01.all-width")
     target = next((tb for tb in tables if "연간" in clean_text(tb.get_text(" ")) or re.search(r"20\d\d", tb.get_text(" "))), None)
-    
-    if not target: return pd.DataFrame()
-    
-    # 헤더(연도) 파싱
+    if not target: raise ValueError("연간 주요재무정보 테이블을 찾지 못했습니다.")
     thead_rows = target.select("thead tr")
     year_cells = thead_rows[-1].find_all(["th", "td"]) if thead_rows else []
+    year_counter = defaultdict(int)
     years = []
     for th in year_cells:
         t = clean_text(th.get_text(" "))
         if t and not re.search(r"주요재무정보|구분", t):
-            years.append(t)
-            
-    # 데이터 파싱
+            year_counter[t] += 1
+            suffix = f"_{year_counter[t]}" if year_counter[t] > 1 else ""
+            years.append(t + suffix)
     rows = []
     for tr in target.select("tbody tr"):
         th = tr.find("th")
@@ -164,314 +187,426 @@ def fetch_main_table(cmp_cd: str, encparam: str, cmp_id: str):
             else:
                 values.append(None)
         rows.append([metric] + values)
-        
-    return pd.DataFrame(rows, columns=["지표"] + years).set_index("지표")
+    df_wide = pd.DataFrame(rows, columns=["지표"] + years).set_index("지표")
+    return df_wide
 
-def fetch_json_mode(cmp_cd: str, mode: str, encparam: str) -> pd.DataFrame:
-    """fs(재무상태표), profit(손익계산서), value(투자지표) JSON 수집"""
-    base_url = "https://navercomp.wisereport.co.kr/v2/company/cF3002.aspx" if mode == "fs" else "https://navercomp.wisereport.co.kr/v2/company/cF4002.aspx"
-    rpt_map = {"fs": "1", "profit": "1", "value": "5"}
-    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1040001.aspx?cmp_cd={cmp_cd}'}
-    params = {'cmp_cd': cmp_cd, 'frq': '0', 'rpt': rpt_map[mode], 'finGubun': 'MAIN', 'frqTyp': '0', 'encparam': encparam}
-    
-    res = requests.get(base_url, params=params, headers=headers, timeout=10)
-    try: js = res.json()
-    except: return pd.DataFrame()
-    
+def parse_json_table(js: dict) -> pd.DataFrame:
     data = js.get("DATA", [])
-    labels = [re.sub(r"<br\s*/?>", " ", l).strip() for l in js.get("YYMM", [])]
+    labels_raw = js.get("YYMM", [])
     unit = js.get("UNIT", "")
-    
     if not data: return pd.DataFrame()
-    
-    # DATA1, DATA2... 키 매핑
+    labels = [re.sub(r"<br\s*/?>", " ", l).strip() for l in labels_raw]
     year_keys = sorted([k for k in data[0] if re.match(r"^DATA\d+$", k)], key=lambda x: int(x[4:]))
+    if len(labels) < len(year_keys): labels += [f"DATA{i+1}" for i in range(len(labels), len(year_keys))]
     rows = [[r.get("ACC_NM", "")] + [r.get(k, "") for k in year_keys] for r in data]
-    
     df = pd.DataFrame(rows, columns=["항목"] + labels[:len(year_keys)])
     df.insert(1, "단위", unit)
     return df
 
+def fetch_json_mode(cmp_cd: str, mode: str, encparam: str) -> pd.DataFrame:
+    url = "https://navercomp.wisereport.co.kr/v2/company/cF3002.aspx" if mode == "fs" else "https://navercomp.wisereport.co.kr/v2/company/cF4002.aspx"
+    rpt_map = {"fs": "1", "profit": "1", "value": "5"}
+    headers = {'Accept': 'application/json, text/html, */*; q=0.01','User-Agent': 'Mozilla/5.0','X-Requested-With': 'XMLHttpRequest','Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1040001.aspx?cmp_cd={cmp_cd}'}
+    params = {'cmp_cd': cmp_cd, 'frq': '0', 'rpt': rpt_map[mode], 'finGubun': 'MAIN', 'frqTyp': '0', 'cn': '', 'encparam': encparam}
+    res = requests.get(url, params=params, headers=headers, timeout=20)
+    res.raise_for_status()
+    try: js = res.json()
+    except json.JSONDecodeError: return pd.DataFrame()
+    return parse_json_table(js)
+
 # ──────────────────────────────────────────────────────────────
-# 3. 핵심 지표 추출 (Helper Functions)
+# 값 추출 헬퍼 (원본 유지)
 # ──────────────────────────────────────────────────────────────
-def infer_from_main(df_main_wide, patterns):
+def infer_from_main(df_main_wide: pd.DataFrame, patterns: list[str]):
     if df_main_wide is None or df_main_wide.empty: return None, None, None
     idx = df_main_wide.index.astype(str)
     for p in patterns:
         mask = idx.str.contains(p, case=False, regex=True)
         if mask.any():
-            return pick_prefer_current_then_estimate(df_main_wide.loc[mask].iloc[0])
+            row = df_main_wide.loc[mask].iloc[0]
+            return pick_prefer_current_then_estimate(row)
     return None, None, None
 
-def pick_latest_from_table(df, patterns):
+def pick_latest_from_table(df: pd.DataFrame, patterns: list[str]):
     if df is None or df.empty: return None, None, None
     cols = [c for c in df.columns if c not in ("항목", "단위", "전년대비 (YoY, %)")]
     for p in patterns:
         mask = df["항목"].astype(str).str.contains(p, case=False, regex=True, na=False)
         if mask.any():
-            return pick_prefer_current_then_estimate(df.loc[mask].iloc[0][cols])
+            row = df.loc[mask].iloc[0][cols]
+            return pick_prefer_current_then_estimate(row)
+    return None, None, None
+
+def pick_from_table_with_exclude(df: pd.DataFrame, include_patterns: list[str], exclude_patterns: list[str]):
+    if df is None or df.empty: return None, None, None
+    cols = [c for c in df.columns if c not in ("항목", "단위", "전년대비 (YoY, %)")]
+    s = df["항목"].astype(str)
+    mask_inc = None
+    for p in include_patterns:
+        m = s.str.contains(p, case=False, regex=True, na=False)
+        mask_inc = m if mask_inc is None else (mask_inc | m)
+    if mask_inc is None or not mask_inc.any(): return None, None, None
+    if exclude_patterns:
+        for q in exclude_patterns:
+            excl = s.str.contains(q, case=False, regex=True, na=False)
+            mask_inc = mask_inc & (~excl)
+    if not mask_inc.any(): return None, None, None
+    row = df.loc[mask_inc].iloc[0][cols]
+    return pick_prefer_current_then_estimate(row)
+
+def find_cfo_any(df_value, df_fs):
+    val, col, _ = pick_latest_from_table(df_value, [r'영업활동.*현금흐름|영업활동으로인한현금흐름|^CFO$|CFO<당기>|CFO＜당기＞'])
+    if val is not None: return float(val), f"value:{col}"
+    val, col, _ = pick_latest_from_table(df_fs, [r'영업활동.*현금흐름|영업활동으로인한현금흐름|^CFO$'])
+    if val is not None: return float(val), f"fs:{col}"
+    return None, None
+
+def find_capex_any(df_value, df_fs):
+    val, col, _ = pick_latest_from_table(df_fs, [r'\*?CAPEX|유형자산의\s*취득|설비투자|유형자산.*취득'])
+    if val is not None: return float(val), f"fs:{col}"
+    val, col, _ = pick_latest_from_table(df_value, [r'\*?CAPEX|유형자산의\s*취득|설비투자|유형자산.*취득'])
+    if val is not None: return float(val), f"value:{col}"
+    return None, None
+
+def combine_fcf(cfo, capex):
+    if cfo is None or capex is None: return None
+    return float(cfo - abs(capex)) if capex >= 0 else float(cfo + capex)
+
+def find_fcf_any(df_main, df_value, df_fs):
+    if df_main is not None and not df_main.empty:
+        idx = df_main.index.astype(str)
+        mask = idx.str.contains(r'FCF|자유현금흐름|잉여현금흐름|Free\s*Cash\s*Flow', case=False, regex=True)
+        if mask.any():
+            row = df_main.loc[mask].iloc[0]
+            val, col, typ = pick_prefer_current_then_estimate(row)
+            if val is not None: return float(val), f"main:{col}", "direct-main"
+    fcf0, fcf_col, _ = pick_latest_from_table(df_value, [r'FCF|Free\s*Cash\s*Flow|자유현금흐름|잉여현금흐름'])
+    if fcf0 is not None: return float(fcf0), f"value:{fcf_col}", "direct-value"
+    cfo, cfo_col = find_cfo_any(df_value, df_fs)
+    capex, capex_col = find_capex_any(df_value, df_fs)
+    if cfo is not None and capex is not None:
+        fcf0 = combine_fcf(cfo, capex)
+        sign = '-' if capex >= 0 else '+'
+        return float(fcf0), f"CFO[{cfo_col}] {sign} CAPEX[{capex_col}]", "derived"
     return None, None, None
 
 def extract_core_numbers(df_main, df_fs, df_profit, df_value):
-    # 1. 발행주식수
-    shares, _, _ = infer_from_main(df_main, [r"발행주식수|주식수"])
-    
-    # 2. 순부채 (Net Debt)
-    net_debt, _, _ = pick_latest_from_table(df_fs, [r"^\*?순부채", r"Net\s*Debt"])
-    
-    # 3. EPS / BPS
-    eps, _, _ = pick_latest_from_table(df_value, [r"EPS"])
-    if eps is None: eps, _, _ = infer_from_main(df_main, [r"EPS"])
-    
-    bps, _, _ = pick_latest_from_table(df_value, [r"BPS"])
-    if bps is None: bps, _, _ = infer_from_main(df_main, [r"BPS"])
-    
-    # 4. EBITDA (마진 제외)
-    ebitda = None
-    if df_profit is not None and not df_profit.empty:
-        # EBITDA 항목 찾기 (율, 마진 제외)
-        cols = [c for c in df_profit.columns if c not in ("항목", "단위")]
-        mask = df_profit["항목"].str.contains(r"EBITDA", case=False, na=False) & \
-               ~df_profit["항목"].str.contains(r"율|마진|%", case=False, na=False)
-        if mask.any():
-            ebitda, _, _ = pick_prefer_current_then_estimate(df_profit.loc[mask].iloc[0][cols])
-            
+    shares, shares_col, shares_used = infer_from_main(df_main, [r"발행주식수|주식수|보통주수|총발행주식"])
+    net_debt, nd_col, nd_used = pick_latest_from_table(df_fs, [r"^\*?순부채", r"Net\s*Debt"])
+    eps, eps_col, eps_type = pick_latest_from_table(df_value, [r"EPS"]) or (None, None, None)
+    if eps is None: eps, eps_col, eps_type = infer_from_main(df_main, [r"EPS"])  
+    bps, bps_col, bps_type = pick_latest_from_table(df_value, [r"BPS"]) or (None, None, None)
+    if bps is None: bps, bps_col, bps_type = infer_from_main(df_main, [r"BPS"])  
+    ebitda, e_col, e_type = pick_from_table_with_exclude(df_profit, include_patterns=[r'^\s*EBITDA\s*$', r'EBITDA\s*\(.*\)$', r'\bEBITDA\b'], exclude_patterns=[r'마진|margin|%'])
+    if ebitda is None: ebitda, e_col, e_type = infer_from_main(df_main, [r"^\s*EBITDA\s*$", r"\bEBITDA\b", r"EBITDA\s*\(.*\)$"])
     if ebitda is None:
-        ebitda, _, _ = infer_from_main(df_main, [r"^\s*EBITDA\s*$"])
-
-    # 5. FCF (Main -> Value -> CFO-CAPEX)
-    fcf0 = None
-    # 5-1. Main
-    val, _, _ = infer_from_main(df_main, [r"FCF|자유현금흐름|잉여현금흐름"])
-    if val is not None: fcf0 = val
-    
-    # 5-2. Value Table
-    if fcf0 is None:
-        val, _, _ = pick_latest_from_table(df_value, [r"FCF|자유현금흐름"])
-        if val is not None: fcf0 = val
-        
-    # 5-3. CFO - CAPEX
-    if fcf0 is None:
-        cfo, _, _ = pick_latest_from_table(df_value, [r"영업활동.*현금흐름|CFO"])
-        if cfo is None: cfo, _, _ = pick_latest_from_table(df_fs, [r"영업활동.*현금흐름|CFO"])
-        
-        capex, _, _ = pick_latest_from_table(df_fs, [r"CAPEX|유형자산.*취득|설비투자"])
-        if capex is None: capex, _, _ = pick_latest_from_table(df_value, [r"CAPEX|유형자산.*취득"])
-        
-        if cfo is not None and capex is not None:
-            # CAPEX가 양수로 표기되어 있으면 빼주고, 음수면 더해줌(보통 현금유출은 음수표기지만 양수표기인 경우도 있음)
-            # 여기서는 안전하게 절대값을 뺌
-            fcf0 = float(cfo) - abs(float(capex))
-
-    return {"shares": shares, "net_debt": net_debt, "eps": eps, "bps": bps, "ebitda": ebitda, "fcf0": fcf0}
+        op_inc, op_col, _ = pick_from_table_with_exclude(df_profit, [r'영업이익|Operating\s*Income|OP'], [r'율|마진|margin|%'])
+        da, da_col, _ = pick_from_table_with_exclude(df_profit, [r'감가상각비|상각비|Depreciation|Amortization|D&A|DA'], [r'율|마진|margin|%'])
+        if op_inc is not None and da is not None:
+            ebitda = float(op_inc) + float(da)
+            e_col = f"영업이익[{op_col}] + 상각비[{da_col}]"
+            e_type = "derived"
+    fcf0, fcf_col, fcf_type = find_fcf_any(df_main, df_value, df_fs)
+    meta_cols = {'shares_col': shares_col, 'shares_type': shares_used, 'net_debt_col': nd_col, 'net_debt_type': nd_used, 'eps_col': eps_col, 'eps_type': eps_type, 'bps_col': bps_col, 'bps_type': bps_type, 'ebitda_col': e_col, 'ebitda_type': e_type, 'fcf_col': fcf_col, 'fcf_type': fcf_type}
+    return {"shares": shares, "net_debt": net_debt, "eps": eps, "bps": bps, "ebitda": ebitda, "fcf0": fcf0, "meta_cols": meta_cols}
 
 # ──────────────────────────────────────────────────────────────
-# 4. Valuation 로직 (통합됨)
+# Valuation 엔진 (원본 유지)
 # ──────────────────────────────────────────────────────────────
-def calculate_dcf(fcf0, g_high, g_mid, g_low, g_tv, r, shares, net_debt, safety):
-    if not all([shares, r, fcf0]): return None, None, None, None
-    
-    years = range(1, 11)
-    growths = [g_high]*3 + [g_mid]*3 + [g_low]*4
-    
-    fcfs = []
-    last = fcf0
+def dcf_fair_price(fcf0, g_high, g_mid, g_low, g_tv, r, shares, net_debt, safety=0.0):
+    if not shares or shares <= 0 or not r or r <= 0 or fcf0 is None: return None, None, None, None
+    years = list(range(1, 11))
+    growths = [g_high if y <= 3 else (g_mid if y <= 6 else g_low) for y in years]
+    fcfs, last = [], float(fcf0)
     for g in growths:
-        last *= (1 + g)
+        last = last * (1.0 + g)
         fcfs.append(last)
-        
-    disc_factors = [1 / ((1 + r) ** t) for t in years]
-    pv_fcfs = [f * d for f, d in zip(fcfs, disc_factors)]
-    
-    # Terminal Value
-    term_val = fcfs[-1] * (1 + g_tv) / (r - g_tv) if r > g_tv else 0
-    pv_tv = term_val * disc_factors[-1]
-    
-    ev = sum(pv_fcfs) + pv_tv
-    equity = ev - (net_debt or 0)
-    price = (equity / shares) * (1 - safety)
-    
-    detail = pd.DataFrame({"Year": list(years) + ["TV"], "FCF": fcfs + [term_val], "PV": pv_fcfs + [pv_tv]})
-    return price, ev, equity, detail
+    disc = [(1.0 / ((1.0 + r) ** t)) for t in years]
+    pv_fcfs = [f * d for f, d in zip(fcfs, disc)]
+    tv = fcfs[-1] * (1.0 + g_tv) / (r - g_tv) if r > g_tv else np.nan
+    pv_tv = tv * disc[-1] if np.isfinite(tv) else 0.0
+    ev = float(np.nansum(pv_fcfs) + pv_tv)
+    equity = ev - (net_debt or 0.0)
+    per_share = equity / shares
+    target = per_share * (1.0 - (safety or 0.0))
+    tv_fcf_display = fcfs[-1] * (1.0 + g_tv) if np.isfinite(tv) else np.nan
+    detail = pd.DataFrame({"Year": years + ["TV"], "FCF": fcfs + [tv_fcf_display], "Discount": disc + [disc[-1]], "PV": pv_fcfs + [pv_tv]})
+    return float(target), float(ev), float(equity), detail
 
-def calculate_multiple_price(metric, multiple, shares=None, net_debt=0, kind='PER', safety=0.0):
-    """PER, PBR, EV/EBITDA 통합 계산"""
-    if metric is None or multiple is None: return None
-    
-    val = 0.0
-    if kind in ['PER', 'PBR']:
-        val = metric * multiple
-    elif kind == 'EV/EBITDA':
-        if not shares: return None
-        ev = metric * multiple
-        equity = ev - (net_debt or 0)
-        val = equity / shares
-        
-    return val * (1 - safety)
+def per_price(eps, per, safety=0.0):
+    if eps is None or per is None: return None
+    return float(eps * per * (1.0 - (safety or 0.0)))
+
+def pbr_price(bps, pbr, safety=0.0):
+    if bps is None or pbr is None: return None
+    return float(bps * pbr * (1.0 - (safety or 0.0)))
+
+def fair_price_ev_ebitda(ev_multiple, ebitda, net_debt, shares_out):
+    if ebitda is None or not np.isfinite(ebitda) or ebitda <= 0: return None
+    if net_debt is None or not np.isfinite(net_debt): net_debt = 0.0
+    if shares_out is None or not np.isfinite(shares_out) or shares_out <= 0: return None
+    ev_fair = float(ev_multiple) * float(ebitda)
+    equity_fair = ev_fair - float(net_debt)
+    px = equity_fair / float(shares_out)
+    return float(px) if np.isfinite(px) else None
+
+def _pick_latest_numeric_row(row, prefer_col: str | None = None):
+    if prefer_col and prefer_col in row.index:
+        v = pd.to_numeric(row.get(prefer_col), errors='coerce')
+        if pd.notna(v): return float(v)
+    for col in reversed(row.index[1:]): 
+        v = pd.to_numeric(row.get(col), errors='coerce')
+        if pd.notna(v): return float(v)
+    return np.nan
+
+def resolve_fcf0(tbl_cashflow: pd.DataFrame | None, tbl_profit: pd.DataFrame | None = None, prefer_col: str | None = None) -> float | None:
+    if tbl_cashflow is not None and not tbl_cashflow.empty:
+        df = tbl_cashflow.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        label_col = df.columns[0]
+        pat_fcf = r'(free\s*cash\s*flow|fcf|자유\s*현금\s*흐름|잉여\s*현금\s*흐름)'
+        m_fcf = df[label_col].astype(str).str.contains(pat_fcf, flags=re.I, regex=True, na=False)
+        if m_fcf.any():
+            v = df.loc[m_fcf].apply(lambda r: _pick_latest_numeric_row(r, prefer_col), axis=1).dropna()
+            if not v.empty and np.isfinite(v.iloc[0]): return float(v.iloc[0])
+        pat_cfo = r'(영업활동현금흐름|영업활동으로인한현금흐름|CFO\b)'
+        pat_capex = r'(유형자산[의]*\s*취득|CAPEX|유형자산의취득|유형자산취득)'
+        m_cfo = df[label_col].astype(str).str.contains(pat_cfo, flags=re.I, regex=True, na=False)
+        m_capex = df[label_col].astype(str).str.contains(pat_capex, flags=re.I, regex=True, na=False)
+        def _pick(mask):
+            if not mask.any(): return np.nan
+            row = df.loc[mask].iloc[0]
+            return _pick_latest_numeric_row(row, prefer_col)
+        cfo = _pick(m_cfo)
+        capex = _pick(m_capex)
+        if np.isfinite(cfo):
+            capex = abs(capex) if np.isfinite(capex) else np.nan
+            return float(cfo - (capex if np.isfinite(capex) else 0.0))
+    if tbl_profit is not None and not tbl_profit.empty:
+        df = tbl_profit.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        label_col = df.columns[0]
+        m = df[label_col].astype(str).str.contains(r'(free\s*cash\s*flow|fcf|자유\s*현금\s*흐름|잉여\s*현금\s*흐름)', flags=re.I, regex=True, na=False)
+        if m.any():
+            v = df.loc[m].apply(lambda r: _pick_latest_numeric_row(r, prefer_col), axis=1).dropna()
+            if not v.empty and np.isfinite(v.iloc[0]): return float(v.iloc[0])
+    return None
 
 # ──────────────────────────────────────────────────────────────
-# 5. UI (Streamlit)
+# UI
 # ──────────────────────────────────────────────────────────────
-st.title("📈 적정주가 계산기 v2.0")
-st.caption("네이버 증권 데이터 기반 자동 수집 및 멀티플/DCF 적정주가 산출 (안전마진 적용)")
+st.title("📈 적정주가 계산기 · 최종본")
+st.caption("현재가는 직접 입력하고, EBITDA는 '당기' 금액 우선·마진 제외, FCF는 main→value→파생 순으로 결정합니다.")
 
-# Session State 초기화
-if 'fetched_price' not in st.session_state: st.session_state.fetched_price = 0.0
-if 'run_analysis' not in st.session_state: st.session_state.run_analysis = False
+# [추가] 현재가 자동 입력값을 위한 세션 상태
+if 'auto_price' not in st.session_state:
+    st.session_state['auto_price'] = 0.0
 
 with st.sidebar:
-    st.header("1. 종목 선택")
-    cmp_cd = st.text_input("종목코드 (6자리)", value="005930") # 삼성전자 기본
+    st.header("입력")
+    cmp_cd = st.text_input("종목코드 (6자리)", value="066570")
     
-    # 현재가 입력 (자동 수집된 값이 있으면 그것을 기본값으로)
-    default_price = st.session_state.fetched_price if st.session_state.fetched_price > 0 else 0.0
-    current_price_input = st.number_input("현재가 (원, 0이면 자동)", value=default_price, step=100.0, format="%.0f")
-    
-    btn_run = st.button("데이터 가져오기 & 분석", type="primary")
-    
-    st.divider()
-    st.header("2. 시나리오 설정")
-    scenario = st.radio("시장 관점", ["보수적", "중립적", "낙관적"], index=1, horizontal=True)
-    
-    # 시나리오별 파라미터 매핑
-    if scenario == '보수적':
-        p = {'g_h': 0.05, 'g_m': 0.03, 'g_l': 0.02, 'g_tv': 0.01, 'r': 0.10, 'safe': 0.35}
-    elif scenario == '낙관적':
-        p = {'g_h': 0.15, 'g_m': 0.10, 'g_l': 0.05, 'g_tv': 0.03, 'r': 0.08, 'safe': 0.20}
-    else: # 중립
-        p = {'g_h': 0.10, 'g_m': 0.06, 'g_l': 0.03, 'g_tv': 0.02, 'r': 0.09, 'safe': 0.30}
-        
-    with st.expander("DCF 상세 변수 수정"):
-        g_high = st.number_input("고성장(1-3년)", value=p['g_h'], format="%.3f")
-        g_mid  = st.number_input("중성장(4-6년)", value=p['g_m'], format="%.3f")
-        g_low  = st.number_input("저성장(7-10년)", value=p['g_l'], format="%.3f")
-        g_tv   = st.number_input("영구성장(TV)", value=p['g_tv'], format="%.3f")
-        r      = st.number_input("할인율(WACC)", value=p['r'], format="%.3f")
-        safety = st.number_input("안전마진", value=p['safe'], format="%.2f")
-
-    st.header("3. 가중치(MIX)")
-    w_dcf = st.slider("DCF 비중", 0.0, 1.0, 0.4)
-    w_per = st.slider("PER 비중", 0.0, 1.0, 0.2)
-    w_pbr = st.slider("PBR 비중", 0.0, 1.0, 0.2)
-    w_ev  = st.slider("EV/EBITDA 비중", 0.0, 1.0, 0.2)
-    
-    st.subheader("멀티플 가정")
-    per_m = st.number_input("Target PER", value=10.0)
-    pbr_m = st.number_input("Target PBR", value=1.2)
-    ev_m  = st.number_input("Target EV/EBITDA", value=6.0)
-
-# 메인 로직
-if btn_run:
-    st.session_state.run_analysis = True
-    # 1. 토큰 및 현재가 수집
-    with st.spinner("네이버 증권 접속 중..."):
-        tk = get_encparam_id_price(cmp_cd, "c1010001")
-        
-    if not tk['encparam']:
-        st.error("토큰 정보를 가져오지 못했습니다. 종목코드를 확인하세요.")
-        st.stop()
-        
-    # 현재가 업데이트 (세션 상태 저장하여 리프레시 후에도 유지)
-    if tk['current_price'] > 0:
-        st.session_state.fetched_price = tk['current_price']
-        
-    # 데이터 수집
-    with st.spinner("재무제표 긁어오는 중..."):
-        df_main = fetch_main_table(cmp_cd, tk['encparam'], tk['id'])
-        df_fs = fetch_json_mode(cmp_cd, "fs", tk['encparam'])
-        df_pf = fetch_json_mode(cmp_cd, "profit", tk['encparam'])
-        df_vl = fetch_json_mode(cmp_cd, "value", tk['encparam'])
-        
-    # 단위 변환 (중요: 여기서만 변환 수행)
-    df_fs = scale_by_unit(df_fs)
-    df_pf = scale_by_unit(df_pf)
-    df_vl = scale_by_unit(df_vl)
-    
-    # 핵심 지표 추출
-    core = extract_core_numbers(df_main, df_fs, df_pf, df_vl)
-    st.session_state.core_data = core # 데이터 저장
-    
-    st.rerun() # 데이터를 다 가져왔으면 UI 갱신을 위해 재실행
-
-if st.session_state.run_analysis and 'core_data' in st.session_state:
-    core = st.session_state.core_data
-    # 현재가 결정 (사용자 입력 우선, 없으면 자동 수집값)
-    final_current_price = current_price_input if current_price_input > 0 else st.session_state.fetched_price
-
-    # 1. 입력값 확인 섹션
-    st.subheader(f"📊 {cmp_cd} 핵심 재무 데이터 (단위: 원)")
-    
-    # 보기 좋게 DataFrame 생성
-    disp_df = pd.DataFrame([core]).T
-    disp_df.columns = ["값"]
-    disp_df["설명"] = ["발행주식수", "순부채 ((-)는 순현금)", "주당순이익(EPS)", "주당순자산(BPS)", "EBITDA", "잉여현금흐름(FCF)"]
-    st.dataframe(disp_df, use_container_width=True)
-    
-    if core['net_debt'] and core['net_debt'] < 0:
-        st.info(f"💡 순부채가 {core['net_debt']:,.0f}원으로 음수입니다. 이는 기업이 빚보다 현금이 많은 '순현금' 상태임을 의미하며, 적정주가를 높이는 요인이 됩니다.")
-
-    # 2. 적정주가 계산
-    # 데이터 정제
-    shares = core['shares']
-    net_debt = core['net_debt'] if core['net_debt'] is not None else 0
-    
-    # (A) DCF
-    px_dcf, ev_dcf, eq_dcf, df_detail = calculate_dcf(
-        core['fcf0'], g_high, g_mid, g_low, g_tv, r, shares, net_debt, safety
+    # [수정] 현재가 입력창에 자동 수집된 값 반영
+    current_price = st.number_input(
+        "현재가 (원)", 
+        min_value=0.0, 
+        value=float(st.session_state['auto_price']), 
+        step=10.0, 
+        format="%.0f"
     )
     
-    # (B) Relative
-    px_per = calculate_multiple_price(core['eps'], per_m, kind='PER', safety=safety)
-    px_pbr = calculate_multiple_price(core['bps'], pbr_m, kind='PBR', safety=safety)
-    px_ev  = calculate_multiple_price(core['ebitda'], ev_m, shares, net_debt, kind='EV/EBITDA', safety=safety)
-    
-    # (C) MIX
-    prices = {'DCF': px_dcf, 'PER': px_per, 'PBR': px_pbr, 'EV/EBITDA': px_ev}
-    weights = {'DCF': w_dcf, 'PER': w_per, 'PBR': w_pbr, 'EV/EBITDA': w_ev}
-    
-    valid_prices = []
-    valid_weights = []
-    
-    for k, v in prices.items():
-        if v is not None and v > 0:
-            valid_prices.append(v)
-            valid_weights.append(weights[k])
-            
-    if valid_prices:
-        final_w = np.array(valid_weights) / sum(valid_weights)
-        mix_price = np.dot(valid_prices, final_w)
-    else:
-        mix_price = 0
-        
-    # 3. 결과 시각화
-    st.divider()
+    run = st.button("자동 수집 → 계산", type="primary")
+
+    st.header("시나리오")
+    if 'scenario' not in st.session_state: st.session_state['scenario'] = '기준'
     c1, c2, c3 = st.columns(3)
-    c1.metric("현재 주가", f"{final_current_price:,.0f} 원")
-    c2.metric("적정 주가 (MIX)", f"{mix_price:,.0f} 원", delta=f"{mix_price - final_current_price:,.0f} 원")
+    if c1.button("보수"): st.session_state['scenario'] = '보수'
+    if c2.button("기준"): st.session_state['scenario'] = '기준'
+    if c3.button("낙관"): st.session_state['scenario'] = '낙관'
+    st.write(f"선택된 시나리오: **{st.session_state['scenario']}**")
+
+    def scenario_params(name: str):
+        if name == '보수': return dict(g_high=0.08, g_mid=0.05, g_low=0.03, g_tv=0.02, r=0.10, safety=0.35)
+        if name == '낙관': return dict(g_high=0.18, g_mid=0.12, g_low=0.06, g_tv=0.035, r=0.08, safety=0.25)
+        return dict(g_high=0.15, g_mid=0.10, g_low=0.05, g_tv=0.03, r=0.09, safety=0.30)
+
+    par = scenario_params(st.session_state['scenario'])
+
+    st.subheader("DCF 파라미터")
+    g_high = st.number_input("고성장률 (Y1~Y3)", value=par['g_high'], step=0.005)
+    g_mid  = st.number_input("중간성장률 (Y4~Y6)", value=par['g_mid'], step=0.005)
+    g_low  = st.number_input("저성장률 (Y7~Y10)", value=par['g_low'], step=0.005)
+    g_tv   = st.number_input("장기성장률 g (TV)", value=par['g_tv'], step=0.005)
+    r      = st.number_input("할인율 r (WACC)", value=par['r'], step=0.005)
+    safety = st.number_input("안전마진", value=par['safety'], step=0.05)
+
+    st.subheader("상대가치 배수")
+    per_mult = st.number_input("업종 PER", value=12.0, step=0.5)
+    pbr_mult = st.number_input("업종 PBR", value=1.2, step=0.1)
+    ev_mult  = st.number_input("EV/EBITDA", value=7.0, step=0.5)
+
+    st.subheader("MIX 가중치")
+    w_dcf = st.slider("DCF", 0.0, 1.0, 0.4, 0.05)
+    w_per = st.slider("PER", 0.0, 1.0, 0.2, 0.05)
+    w_pbr = st.slider("PBR", 0.0, 1.0, 0.2, 0.05)
+    w_ev  = st.slider("EV/EBITDA", 0.0, 1.0, 0.2, 0.05)
+
+if run:
+    if not re.fullmatch(r"\d{6}", cmp_cd):
+        st.error("종목코드는 6자리 숫자여야 합니다.")
+        st.stop()
+
+    page_key = "c1010001"
+    with st.spinner("토큰 획득 중..."):
+        tk = get_encparam_and_id(cmp_cd, page_key)
     
-    upside = ((mix_price / final_current_price) - 1) * 100 if final_current_price > 0 else 0
-    c3.metric("상승 여력", f"{upside:.2f} %", delta_color="normal" if upside > 0 else "inverse")
+    encparam, cmp_id = tk.get("encparam"), tk.get("id")
     
-    # 차트
-    res_df = pd.DataFrame({
-        "Method": list(prices.keys()) + ["MIX"],
-        "Price": [p if p else 0 for p in prices.values()] + [mix_price]
-    })
+    # [추가] 자동으로 가져온 현재가가 있으면 세션 업데이트 및 변수 반영
+    if tk.get("auto_price", 0) > 0:
+        st.session_state['auto_price'] = tk['auto_price']
+        if current_price == 0: # 사용자가 입력 안했으면 자동값 사용
+            current_price = tk['auto_price']
+            st.toast(f"현재가 자동 수집됨: {current_price:,.0f}원")
+
+    cA, cB, cC = st.columns(3)
+    cA.metric("종목코드", cmp_cd)
+    cB.metric("encparam", (encparam[:10] + "…") if encparam else "없음")
+    cC.metric("id", cmp_id or "없음")
     
-    fig = go.Figure(data=[
-        go.Bar(x=res_df["Method"], y=res_df["Price"], text=res_df["Price"].apply(lambda x: f"{x:,.0f}"), textposition='auto', marker_color=['#e0e0e0']*4 + ['#ff4b4b'])
-    ])
-    fig.add_hline(y=final_current_price, line_dash="dot", annotation_text="현재가", annotation_position="bottom right")
-    fig.update_layout(title="Valuation Summary", template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
+    if not encparam or not cmp_id:
+        st.warning("토큰 추출 실패. 잠시 후 재시도.")
+        st.stop()
+
+    with st.spinner("데이터 수집(main/fs/profit/value)..."):
+        df_main   = fetch_main_table(cmp_cd, encparam, cmp_id)
+        df_fs     = fetch_json_mode(cmp_cd, "fs", encparam)
+        df_profit = fetch_json_mode(cmp_cd, "profit", encparam)
+        df_value  = fetch_json_mode(cmp_cd, "value", encparam)
+
+    # 단위 환산(원)
+    df_fs = scale_by_unit(df_fs)
+    df_profit = scale_by_unit(df_profit)
+    df_value = scale_by_unit(df_value)
+
+    with st.spinner("핵심 값 추출 중..."):
+        core = extract_core_numbers(df_main, df_fs, df_profit, df_value)
+
+    st.subheader("🔑 추출된 핵심 입력값")
+    core_view = pd.DataFrame([{
+        '발행주식수(주)': core['shares'],
+        '순부채(원)': core['net_debt'],
+        'EPS(예상/실적)': core['eps'],
+        'BPS(예상/실적)': core['bps'],
+        'EBITDA(원)': core['ebitda'],
+        'FCF₀(원)': core['fcf0'],
+    }])
+    st.dataframe(core_view, use_container_width=True)
+
+    with st.expander("선택된 열/출처(META)"):
+        st.json(core['meta_cols'])
+
+    missing = []
+    if core.get("fcf0") is None: missing.append("FCF₀")
+    if core.get("shares") in (None, 0, np.nan): missing.append("주식수")
+    if r in (None, 0, np.nan): missing.append("할인율 r")
+    if missing: st.warning("DCF 계산이 비활성화된 이유: " + ", ".join(missing))
+    if core.get("fcf0") is None:
+        core["fcf0"] = resolve_fcf0(tbl_cashflow=df_fs, tbl_profit=df_profit, prefer_col=None)
+
+    # --- Valuation (정규화 + 가드 버전) ---------------------------------------
+    def _to_float(x, default=None):
+        try:
+            if x is None or (isinstance(x, float) and np.isnan(x)): return default
+            if isinstance(x, str): x = x.replace(",", "").strip()
+            v = float(x)
+            return v if np.isfinite(v) else default
+        except Exception: return default
     
-    # DCF 상세 다운로드
-    if df_detail is not None:
-        with st.expander("DCF 상세 계산 내역 보기"):
-            st.dataframe(df_detail)
-            csv = df_detail.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("DCF 엑셀 다운로드", csv, "dcf_detail.csv", "text/csv")
+    def _rate(x):
+        v = _to_float(x, default=None)
+        if v is None: return None
+        return v/100.0 if v > 1.0 else v
+    
+    def _clamp_r_gt_g(r0, g0, eps=1e-4):
+        if r0 is None or g0 is None: return r0, g0
+        return (r0, min(g0, r0 - eps)) if r0 <= g0 else (r0, g0)
+    
+    fcf0     = _to_float(core.get("fcf0"))
+    ebitda   = _to_float(core.get("ebitda"))
+    shares   = _to_float(core.get("shares"))
+    net_debt = _to_float(core.get("net_debt"), default=0.0)
+
+    # [수정] 단위 중복 계산 제거 (scale_by_unit에서 이미 처리됨)
+    # UNIT = 1e8
+    # if fcf0 is not None: fcf0 *= UNIT
+    # if ebitda is not None: ebitda *= UNIT
+
+    r_n      = _rate(r)
+    gH, gM, gL = _rate(g_high), _rate(g_mid), _rate(g_low)
+    g_tv_n   = _rate(g_tv)
+    r_n, g_tv_n = _clamp_r_gt_g(r_n, g_tv_n)
+    
+    ev_mult_n = _to_float(ev_mult)
+    ev_mult_n = ev_mult_n if (ev_mult_n is not None and ev_mult_n > 0) else None
+    
+    px_dcf, ev, equity, dcf_detail = dcf_fair_price(
+        fcf0=fcf0, g_high=gH, g_mid=gM, g_low=gL, g_tv=g_tv_n, r=r_n,
+        shares=shares, net_debt=net_debt, safety=safety
+    )
+    
+    px_per = per_price(core["eps"], per_mult, safety=safety)
+    px_pbr = pbr_price(core["bps"], pbr_mult, safety=safety)
+    
+    px_ev  = fair_price_ev_ebitda(
+        ev_multiple=ev_mult_n, ebitda=ebitda, net_debt=net_debt, shares_out=shares
+    )
+    if px_ev is not None:
+        px_ev = px_ev * (1.0 - (safety or 0.0)) # 안전마진 적용
+
+    pairs = [(px_dcf, w_dcf), (px_per, w_per), (px_pbr, w_pbr), (px_ev, w_ev)]
+    use_wsum = sum(w for px, w in pairs if px is not None) or 1.0
+    mix_price = (float(np.nansum([px * (w / use_wsum) for px, w in pairs if px is not None]))
+                 if any(px is not None for px, _ in pairs) else None)
+    
+    st.caption(f"DBG ▶ shares={shares}, r={r_n}, g_tv={g_tv_n}, FCF0={fcf0}, EBITDA={ebitda}")
+
+    if isinstance(dcf_detail, pd.DataFrame) and not dcf_detail.empty:
+        st.subheader("🔍 DCF 상세 (연도별 FCF / 할인계수 / 현재가치)")
+        df_show = dcf_detail.copy()
+        if "PV" in df_show.columns: df_show["누적PV"] = df_show["PV"].cumsum()
+        def _fmt(v, nd=0):
+            if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))): return ""
+            try: return f"{float(v):,.{nd}f}"
+            except: return str(v)
+        cols = []
+        if "Year" in df_show.columns: cols.append(("Year", "Year"))
+        if "FCF" in df_show.columns: cols.append(("FCF", "FCF(원)"))
+        if "Discount" in df_show.columns: cols.append(("Discount", "Discount"))
+        if "PV" in df_show.columns: cols.append(("PV", "PV(원)"))
+        if "누적PV" in df_show.columns: cols.append(("누적PV", "누적PV(원)"))
+        df_disp = pd.DataFrame({new: (df_show[old].apply(lambda v: _fmt(v, 4)) if old == "Discount" else df_show[old].apply(lambda v: _fmt(v, 0))) if old in df_show.columns else [] for (old, new) in cols})
+        st.dataframe(df_disp, use_container_width=True, hide_index=True)
+        
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            dcf_detail.to_excel(writer, index=False, sheet_name="DCF_Detail_Raw")
+            df_disp.to_excel(writer, index=False, sheet_name="DCF_Detail_Display")
+        c1, c2 = st.columns(2)
+        c1.download_button("📥 DCF 상세(Excel)", data=buf.getvalue(), file_name="dcf_detail.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        c2.download_button("📥 DCF 상세(CSV)", data=dcf_detail.to_csv(index=False).encode("utf-8-sig"), file_name="dcf_detail.csv", mime="text/csv", use_container_width=True)
+
+    st.subheader("📌 적정주가 요약")
+    summary = pd.DataFrame({"방법": ["DCF", "PER", "PBR", "EV/EBITDA", "MIX(가중)"], "적정주가": [px_dcf, px_per, px_pbr, px_ev, mix_price]})
+    fig = safe_bar_go(summary, "방법", "적정주가", title="방법별 적정주가")
+    if fig is None: st.info("표시할 적정주가 값이 없습니다.")
+    else: st.plotly_chart(fig, use_container_width=True)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("현재가", f"{current_price:,.0f} 원")
+    col2.metric("적정가(MIX)", f"{(mix_price or 0):,.0f} 원")
+    up = None if not current_price or not mix_price else (mix_price / current_price - 1.0) * 100.0
+    col3.metric("상승여력", f"{up:.2f}%" if up is not None else "-")
 
 else:
-    st.info("좌측 사이드바에서 종목코드를 입력하고 '데이터 가져오기'를 눌러주세요.")
+    st.info("좌측에서 종목코드·현재가를 입력하고 실행하세요.")
